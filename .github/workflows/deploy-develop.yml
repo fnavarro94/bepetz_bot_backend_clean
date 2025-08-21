@@ -59,19 +59,19 @@ jobs:
                 --vpc-egress private-ranges-only"
 
           ENV="STREAM_REDIS_HOST=${{ steps.redis.outputs.host }},\
-STREAM_REDIS_PORT=${{ steps.redis.outputs.port }},\
-STREAM_REDIS_SSL=${{ vars.STREAM_REDIS_SSL }},\
-REDIS_URL=${{ steps.redis.outputs.url }},\
-GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},\
-GOOGLE_CLOUD_LOCATION=${{ vars.GCP_REGION }},\
-GOOGLE_CLOUD_PROJECT=${{ vars.GCP_PROJECT_ID }},\
-BASE_URL=${{ vars.BASE_URL }},\
-APP_NAME=${{ vars.APP_NAME }},\
-CHATS_FIRESTORE_DB=${{ vars.CHATS_FIRESTORE_DB }},\
-CHAT_UPLOAD_BUCKET=${{ vars.CHAT_UPLOAD_BUCKET }},\
-AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},\
-GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
-DATABASE_URL=${{ secrets.DATABASE_URL }}"
+          STREAM_REDIS_PORT=${{ steps.redis.outputs.port }},\
+          STREAM_REDIS_SSL=${{ vars.STREAM_REDIS_SSL }},\
+          REDIS_URL=${{ steps.redis.outputs.url }},\
+          GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},\
+          GOOGLE_CLOUD_LOCATION=${{ vars.GCP_REGION }},\
+          GOOGLE_CLOUD_PROJECT=${{ vars.GCP_PROJECT_ID }},\
+          BASE_URL=${{ vars.BASE_URL }},\
+          APP_NAME=${{ vars.APP_NAME }},\
+          CHATS_FIRESTORE_DB=${{ vars.CHATS_FIRESTORE_DB }},\
+          CHAT_UPLOAD_BUCKET=${{ vars.CHAT_UPLOAD_BUCKET }},\
+          AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},\
+          GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
+          DATABASE_URL=${{ secrets.DATABASE_URL }}"
 
           if [ "${{ matrix.app }}" = "api" ] || [ "${{ matrix.app }}" = "relay" ]; then
             gcloud run deploy "$SERVICE" $BASE --allow-unauthenticated \
