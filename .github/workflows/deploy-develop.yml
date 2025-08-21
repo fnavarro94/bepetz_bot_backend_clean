@@ -1,0 +1,83 @@
+name: deploy-develop
+on:
+  push: { branches: [develop] }
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { app: [api, worker, relay] }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: ch
+        run: |
+          if git diff --quiet HEAD^ HEAD -- apps/${{ matrix.app }} libs; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+      - if: steps.ch.outputs.changed == 'false'
+        run: echo "No changes for ${{ matrix.app }}"; exit 0
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDP }}
+          service_account:           ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Build & Push image (Cloud Build → Artifact Registry)
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/${{ matrix.app }}:${{ github.sha }}"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          gcloud builds submit -f apps/${{ matrix.app }}/Dockerfile --tag "$IMAGE" .
+
+      - name: Resolve Redis endpoint
+        id: redis
+        run: |
+          read HOST PORT < <(gcloud redis instances describe "${{ vars.REDIS_INSTANCE }}" --region "${{ vars.GCP_REGION }}" --format='value(host,port)')
+          echo "host=$HOST" >> $GITHUB_OUTPUT
+          echo "port=$PORT" >> $GITHUB_OUTPUT
+          echo "url=redis://$HOST:$PORT/0" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Cloud Run
+        run: |
+          SERVICE="chatbot-${{ matrix.app }}"
+          BASE="--project ${{ vars.GCP_PROJECT_ID }} --region ${{ vars.GCP_REGION }} \
+                --image $IMAGE --service-account ${{ vars.RUNTIME_SA_EMAIL }} \
+                --network ${{ vars.NETWORK }} --subnet ${{ vars.SUBNET }} \
+                --vpc-egress private-ranges-only"
+
+          ENV="STREAM_REDIS_HOST=${{ steps.redis.outputs.host }},\
+STREAM_REDIS_PORT=${{ steps.redis.outputs.port }},\
+STREAM_REDIS_SSL=${{ vars.STREAM_REDIS_SSL }},\
+REDIS_URL=${{ steps.redis.outputs.url }},\
+GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},\
+GOOGLE_CLOUD_LOCATION=${{ vars.GCP_REGION }},\
+GOOGLE_CLOUD_PROJECT=${{ vars.GCP_PROJECT_ID }},\
+BASE_URL=${{ vars.BASE_URL }},\
+APP_NAME=${{ vars.APP_NAME }},\
+CHATS_FIRESTORE_DB=${{ vars.CHATS_FIRESTORE_DB }},\
+CHAT_UPLOAD_BUCKET=${{ vars.CHAT_UPLOAD_BUCKET }},\
+AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},\
+GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
+DATABASE_URL=${{ secrets.DATABASE_URL }}"
+
+          if [ "${{ matrix.app }}" = "api" ] || [ "${{ matrix.app }}" = "relay" ]; then
+            gcloud run deploy "$SERVICE" $BASE --allow-unauthenticated \
+              --min-instances=1 --set-env-vars "$ENV"
+          else
+            gcloud run deploy "$SERVICE" $BASE --no-allow-unauthenticated \
+              --cpu=2 --no-cpu-throttling --cpu-boost --memory=1Gi \
+              --min-instances=1 --set-env-vars "$ENV"
+          fi
