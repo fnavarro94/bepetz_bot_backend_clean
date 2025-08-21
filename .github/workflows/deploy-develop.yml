@@ -70,12 +70,12 @@ jobs:
       - name: Tag image as :latest (optional)
         run: |
           IMAGE_BASE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/chatbot-${{ matrix.app }}"
-          gcloud artifacts docker tags add \
-            "${IMAGE_BASE}:${{ github.sha }}" \
-            "${IMAGE_BASE}:latest" \
-            --project="${{ vars.GCP_PROJECT_ID }}" \
-            --location="${{ vars.GCP_REGION }}"
-          echo "IMAGE_LATEST=${IMAGE_BASE}:latest" >> $GITHUB_ENV
+          IMAGE_SHA="${IMAGE_BASE}:${{ github.sha }}"
+          IMAGE_LATEST="${IMAGE_BASE}:latest"
+          echo "IMAGE_LATEST=$IMAGE_LATEST" >> $GITHUB_ENV
+          gcloud artifacts docker tags add "$IMAGE_SHA" "$IMAGE_LATEST" \
+            --project="${{ vars.GCP_PROJECT_ID }}"
+
 
 
       - name: Resolve Redis endpoint
