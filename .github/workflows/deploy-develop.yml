@@ -62,19 +62,21 @@ jobs:
           IMAGE_SHA="${IMAGE_BASE}:${{ github.sha }}"
           echo "IMAGE_SHA=$IMAGE_SHA" >> $GITHUB_ENV
 
-          # Build using the app folder as context (it has a Dockerfile)
-          gcloud builds submit "apps/${{ matrix.app }}" --tag "$IMAGE_SHA"
+          # Build from repo root so Docker can see libs/, tasks/, etc.
+          gcloud builds submit . \
+            --config=cloudbuild-docker.yaml \
+            --substitutions=_APP=${{ matrix.app }},_IMAGE=${IMAGE_SHA}
 
-      # Optional: also tag it as :latest to match your manual deploys
       - name: Tag image as :latest (optional)
         run: |
           IMAGE_BASE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/chatbot-${{ matrix.app }}"
-          IMAGE_SHA="${IMAGE_BASE}:${{ github.sha }}"
-          IMAGE_LATEST="${IMAGE_BASE}:latest"
-          echo "IMAGE_LATEST=$IMAGE_LATEST" >> $GITHUB_ENV
-          gcloud artifacts docker tags add "$IMAGE_SHA" "$IMAGE_LATEST" \
+          gcloud artifacts docker tags add \
+            "${IMAGE_BASE}:${{ github.sha }}" \
+            "${IMAGE_BASE}:latest" \
             --project="${{ vars.GCP_PROJECT_ID }}" \
             --location="${{ vars.GCP_REGION }}"
+          echo "IMAGE_LATEST=${IMAGE_BASE}:latest" >> $GITHUB_ENV
+
 
       - name: Resolve Redis endpoint
         id: redis
