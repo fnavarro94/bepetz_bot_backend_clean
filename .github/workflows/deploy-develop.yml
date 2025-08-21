@@ -37,12 +37,14 @@ jobs:
       # TEMP: inspect OIDC claims to align provider condition
       - name: 🔎 Dump GitHub OIDC claims
         uses: actions/github-script@v7
+        continue-on-error: true
         with:
           script: |
-            const core = require('@actions/core');
-            const tok = await core.getIDToken('sts.googleapis.com');
-            const body = JSON.parse(Buffer.from(tok.split('.')[1], 'base64').toString());
-            console.log('OIDC claims:', JSON.stringify(body, null, 2));
+            const token = await core.getIDToken('sts.googleapis.com'); // core is pre-injected
+            const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+            console.log('GITHUB_REPOSITORY:', process.env.GITHUB_REPOSITORY);
+            console.log('GITHUB_REF:', process.env.GITHUB_REF);
+            console.log('OIDC claims:', JSON.stringify(payload, null, 2));
 
       # Auth to GCP via OIDC/WIF
       - uses: google-github-actions/auth@v2
