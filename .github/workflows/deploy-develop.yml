@@ -56,11 +56,25 @@ jobs:
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      - name: Build & Push image (Cloud Build → Artifact Registry)
+      - name: Build image (Cloud Build → Artifact Registry)
         run: |
-          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/${{ matrix.app }}:${{ github.sha }}"
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-          gcloud builds submit -f apps/${{ matrix.app }}/Dockerfile --tag "$IMAGE" .
+          IMAGE_BASE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/chatbot-${{ matrix.app }}"
+          IMAGE_SHA="${IMAGE_BASE}:${{ github.sha }}"
+          echo "IMAGE_SHA=$IMAGE_SHA" >> $GITHUB_ENV
+
+          # Build using the app folder as context (it has a Dockerfile)
+          gcloud builds submit "apps/${{ matrix.app }}" --tag "$IMAGE_SHA"
+
+      # Optional: also tag it as :latest to match your manual deploys
+      - name: Tag image as :latest (optional)
+        run: |
+          IMAGE_BASE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/chatbot-${{ matrix.app }}"
+          IMAGE_SHA="${IMAGE_BASE}:${{ github.sha }}"
+          IMAGE_LATEST="${IMAGE_BASE}:latest"
+          echo "IMAGE_LATEST=$IMAGE_LATEST" >> $GITHUB_ENV
+          gcloud artifacts docker tags add "$IMAGE_SHA" "$IMAGE_LATEST" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --location="${{ vars.GCP_REGION }}"
 
       - name: Resolve Redis endpoint
         id: redis
