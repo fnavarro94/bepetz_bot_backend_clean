@@ -1,7 +1,7 @@
 # --- Environment ---
 # Never commit your environment variables file. It contains secrets!
 .env
-
+service_account.json
 # --- Virtual Environments ---
 # Exclude the virtual environment directory to avoid committing installed packages.
 # Replace with the actual name of your venv folder if different.
