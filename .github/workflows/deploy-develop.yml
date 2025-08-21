@@ -1,32 +1,50 @@
 name: deploy-develop
 on:
-  push: { branches: [develop] }
+  push:
+    branches: [develop]
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
+  id-token: write   # required for OIDC
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     strategy:
-      matrix: { app: [api, worker, relay] }
+      matrix:
+        app: [api, worker, relay]
 
     steps:
       - uses: actions/checkout@v4
 
+      # Safe on first commit to the branch
       - name: Detect changes
         id: ch
         run: |
-          if git diff --quiet HEAD^ HEAD -- apps/${{ matrix.app }} libs; then
-            echo "changed=false" >> $GITHUB_OUTPUT
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            if git diff --quiet HEAD^ HEAD -- apps/${{ matrix.app }} libs; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+            else
+              echo "changed=true" >> $GITHUB_OUTPUT
+            fi
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
       - if: steps.ch.outputs.changed == 'false'
         run: echo "No changes for ${{ matrix.app }}"; exit 0
 
+      # TEMP: inspect OIDC claims to align provider condition
+      - name: 🔎 Dump GitHub OIDC claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+            const tok = await core.getIDToken('sts.googleapis.com');
+            const body = JSON.parse(Buffer.from(tok.split('.')[1], 'base64').toString());
+            console.log('OIDC claims:', JSON.stringify(body, null, 2));
+
+      # Auth to GCP via OIDC/WIF
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDP }}
@@ -45,7 +63,8 @@ jobs:
       - name: Resolve Redis endpoint
         id: redis
         run: |
-          read HOST PORT < <(gcloud redis instances describe "${{ vars.REDIS_INSTANCE }}" --region "${{ vars.GCP_REGION }}" --format='value(host,port)')
+          read HOST PORT < <(gcloud redis instances describe "${{ vars.REDIS_INSTANCE }}" \
+            --region "${{ vars.GCP_REGION }}" --format='value(host,port)')
           echo "host=$HOST" >> $GITHUB_OUTPUT
           echo "port=$PORT" >> $GITHUB_OUTPUT
           echo "url=redis://$HOST:$PORT/0" >> $GITHUB_OUTPUT
@@ -53,31 +72,27 @@ jobs:
       - name: Deploy to Cloud Run
         run: |
           SERVICE="chatbot-${{ matrix.app }}"
-          BASE="--project ${{ vars.GCP_PROJECT_ID }} --region ${{ vars.GCP_REGION }} \
-                --image $IMAGE --service-account ${{ vars.RUNTIME_SA_EMAIL }} \
-                --network ${{ vars.NETWORK }} --subnet ${{ vars.SUBNET }} \
+          BASE="--project ${{ vars.GCP_PROJECT_ID }} \
+                --region  ${{ vars.GCP_REGION }} \
+                --image   $IMAGE \
+                --service-account ${{ vars.RUNTIME_SA_EMAIL }} \
+                --network ${{ vars.NETWORK }} \
+                --subnet  ${{ vars.SUBNET }} \
                 --vpc-egress private-ranges-only"
 
-          ENV="STREAM_REDIS_HOST=${{ steps.redis.outputs.host }},\
-          STREAM_REDIS_PORT=${{ steps.redis.outputs.port }},\
-          STREAM_REDIS_SSL=${{ vars.STREAM_REDIS_SSL }},\
-          REDIS_URL=${{ steps.redis.outputs.url }},\
-          GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},\
-          GOOGLE_CLOUD_LOCATION=${{ vars.GCP_REGION }},\
-          GOOGLE_CLOUD_PROJECT=${{ vars.GCP_PROJECT_ID }},\
-          BASE_URL=${{ vars.BASE_URL }},\
-          APP_NAME=${{ vars.APP_NAME }},\
-          CHATS_FIRESTORE_DB=${{ vars.CHATS_FIRESTORE_DB }},\
-          CHAT_UPLOAD_BUCKET=${{ vars.CHAT_UPLOAD_BUCKET }},\
-          AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},\
-          GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
-          DATABASE_URL=${{ secrets.DATABASE_URL }}"
+          # Keep this on ONE line so --set-env-vars parses correctly
+          ENV="STREAM_REDIS_HOST=${{ steps.redis.outputs.host }},STREAM_REDIS_PORT=${{ steps.redis.outputs.port }},STREAM_REDIS_SSL=${{ vars.STREAM_REDIS_SSL }},REDIS_URL=${{ steps.redis.outputs.url }},GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},GOOGLE_CLOUD_LOCATION=${{ vars.GCP_REGION }},GOOGLE_CLOUD_PROJECT=${{ vars.GCP_PROJECT_ID }},BASE_URL=${{ vars.BASE_URL }},APP_NAME=${{ vars.APP_NAME }},CHATS_FIRESTORE_DB=${{ vars.CHATS_FIRESTORE_DB }},CHAT_UPLOAD_BUCKET=${{ vars.CHAT_UPLOAD_BUCKET }},AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},DATABASE_URL=${{ secrets.DATABASE_URL }}"
 
           if [ "${{ matrix.app }}" = "api" ] || [ "${{ matrix.app }}" = "relay" ]; then
-            gcloud run deploy "$SERVICE" $BASE --allow-unauthenticated \
-              --min-instances=1 --set-env-vars "$ENV"
+            gcloud run deploy "$SERVICE" $BASE \
+              --allow-unauthenticated \
+              --min-instances=1 \
+              --set-env-vars "$ENV"
           else
-            gcloud run deploy "$SERVICE" $BASE --no-allow-unauthenticated \
-              --cpu=2 --no-cpu-throttling --cpu-boost --memory=1Gi \
-              --min-instances=1 --set-env-vars "$ENV"
+            gcloud run deploy "$SERVICE" $BASE \
+              --no-allow-unauthenticated \
+              --cpu=2 --no-cpu-throttling --cpu-boost \
+              --memory=1Gi \
+              --min-instances=1 \
+              --set-env-vars "$ENV"
           fi
