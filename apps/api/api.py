@@ -101,7 +101,7 @@ app.add_middleware(
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 FIRESTORE_DB   = os.getenv("CHATS_FIRESTORE_DB")
 
-print("Probando ci cd api 3")
+print("Probando ci cd api")
 db = firestore.AsyncClient(project=GCP_PROJECT_ID, database=FIRESTORE_DB)
 
 def make_conversation_key(user_id: int, conversation_id: str) -> str:
