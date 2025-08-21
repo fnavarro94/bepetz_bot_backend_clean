@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      STREAM_REDIS_HOST: redis
+      STREAM_REDIS_PORT: "6379"
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
+    volumes:
+      - ./service_account.json:/secrets/service_account.json:ro
+    depends_on:
+      - redis
+    ports:
+      - "8000:8080"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      STREAM_REDIS_HOST: redis
+      STREAM_REDIS_PORT: "6379"
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
+    volumes:
+      - ./service_account.json:/secrets/service_account.json:ro
+    depends_on:
+      - redis
+    ports:
+      - "8081:8080"   # worker health endpoint
+    restart: unless-stopped
+
+  relay:
+    build:
+      context: .
+      dockerfile: apps/relay/Dockerfile
+    env_file: .env
+    environment:
+      STREAM_REDIS_HOST: redis
+      STREAM_REDIS_PORT: "6379"
+    depends_on:
+      - redis
+    ports:
+      - "8001:8080"
+    restart: unless-stopped
+
+volumes:
+  redis-data:

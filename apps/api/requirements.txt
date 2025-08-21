@@ -1,0 +1,22 @@
+# ── Web framework ────────────────────────────────────────────────
+fastapi==0.115.14
+uvicorn==0.35.0
+asyncpg==0.30.0
+
+# ── Data models ──────────────────────────────────────────────────
+pydantic==2.11.7               # Field, BaseModel, etc.
+
+# ── Task queue & broker ──────────────────────────────────────────
+taskiq==0.11.17
+taskiq-redis==1.0.9
+redis==5.3.0                   # async client
+
+# ── GCP libs pulled in by tasks.py (API imports that module) ────
+google-cloud-firestore==2.21.0
+google-cloud-pubsub==2.30.0
+google-adk==1.5.0              # ensure_session, run_agent_stream…
+google-cloud-storage==2.19.0    # signed URLs for uploads
+SQLAlchemy==2.0.41              # imported via common.db_conn
+
+# ── Local‑dev helpers ───────────────────────────────────────────
+python-dotenv==1.1.1
