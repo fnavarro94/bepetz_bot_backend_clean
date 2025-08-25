@@ -30,10 +30,18 @@ log = logging.getLogger("relay-redis")
 
 # ── FASTAPI APP ────────────────────────────────────────────────────────
 app = FastAPI(title="Chat relay (Redis)")
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://bepetz-chatbot-ui-dev.web.app",
+    # "https://bepetz-chatbot-ui-dev--felipe-preview.web.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -118,7 +126,13 @@ async def stream(user_id: str, conversation_id: str):
                 SUB_TASKS.pop(conversation_id).cancel()
             log.info("👋 detach  conv=%s user=%s", conversation_id, user_id)
 
-    return EventSourceResponse(event_gen())
+    return EventSourceResponse(
+                                event_gen(),
+                                headers={
+                                    "Cache-Control": "no-cache, no-transform",
+                                    "X-Accel-Buffering": "no",  # helps prevent proxy buffering
+                                },
+                            )
 
 # ── RUN ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

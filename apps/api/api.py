@@ -91,13 +91,19 @@ app = FastAPI(
 )
 
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://bepetz-chatbot-ui-dev.web.app",
+    # "https://bepetz-chatbot-ui-dev--felipe-preview.web.app",  # optional
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
-
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 FIRESTORE_DB   = os.getenv("CHATS_FIRESTORE_DB")
 
