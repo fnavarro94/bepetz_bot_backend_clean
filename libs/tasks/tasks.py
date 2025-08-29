@@ -428,11 +428,16 @@ async def process_message_task(
         # Create & ensure new ADK session seeded with summary + tail
         # ↓↓↓ ADD THESE TWO LINES (fresh fetch + optional cache) ↓↓↓
         pets = await _fetch_pets(user_id)
+
+        # 🔒 Sanitize everything to make it JSON-safe (converts Firestore Timestamp / DatetimeWithNanoseconds → ISO strings)
+        carry_over_safe = json_sanitize(carry_over)
+        tail_safe       = json_sanitize(tail)
+        pets_safe       = json_sanitize(pets)
         seed_state = {
-            "carry_over": carry_over,
+            "carry_over": carry_over_safe,
             "generation": generation + 1,
-            "tail": tail,
-            "info_mascotas": pets,
+            "tail": tail_safe,
+            "info_mascotas": pets_safe,
         }
 
         new_sid = (await create_session(str(user_id), state=seed_state))["id"]
@@ -691,46 +696,298 @@ def publish_non_blocking_redis(ordering_key: str, chunk: str) -> None:
                  ordering_key, chunk[:40].replace("\n", " "))
     
 
+##### summarizer helpers ####
+import os
+from datetime import datetime, date, timezone
+from google.cloud.firestore_v1.base_query import FieldFilter  # query fix
 
+# --- Summarizer config (env-driven) -------------------------------------------
+# Default to a fast, current model; override via env as needed.
+SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gemini-2.0-flash-001")
+SUMMARIZER_MAX_INPUT_TOKENS = int(os.getenv("SUMMARIZER_MAX_INPUT_TOKENS", "8000"))
+
+# Developer API key (Gemini Developer API). For Vertex, set GOOGLE_GENAI_USE_VERTEXAI=true
+# and GCP_PROJECT_ID/GCP_LOCATION; leave this empty.
+SUMMARIZER_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+
+def _approx_tokens(s: str) -> int:
+    # quick-and-dirty; swap with a real tokenizer when ready
+    return max(1, len(s) // 4)
+
+
+def _to_notes(facts) -> str:
+    """Turn list[str] or list[dict] into a bullet list string."""
+    if not facts:
+        return ""
+    if isinstance(facts, list):
+        out = []
+        for f in facts:
+            if isinstance(f, str):
+                out.append(f"- " + f.strip())
+            elif isinstance(f, dict):
+                if "text" in f:
+                    out.append(f"- " + str(f["text"]).strip())
+                else:
+                    ev = " / ".join(str(f.get(k)) for k in ("entity", "key", "value") if f.get(k))
+                    if ev:
+                        out.append("- " + ev)
+        return "\n".join(out)
+    return str(facts)
+
+
+def _ts_iso(ts):
+    if ts is None:
+        return None
+    try:
+        return ts.isoformat()
+    except Exception:
+        return str(ts)
+
+
+def json_sanitize(obj):
+    """
+    Recursively convert Firestore/Datetime objects to JSON-friendly values.
+    - Datetime/Date/DatetimeWithNanoseconds -> ISO 8601 strings
+    - Tuples -> lists
+    """
+    try:
+        from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+        DTWNS = DatetimeWithNanoseconds
+    except Exception:
+        DTWNS = datetime  # minimal duck type fallback
+
+    if isinstance(obj, (datetime, date, DTWNS)):
+        return _ts_iso(obj)
+    if isinstance(obj, dict):
+        return {k: json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_sanitize(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [json_sanitize(v) for v in obj]
+    return obj
 
 
 @broker.task
 async def summarizer_task(user_id: int, generation: int):
+    """
+    Single-pass Gemini summarization (google-genai SDK):
+      - Build a bounded transcript up to summarize_started_at
+      - Ask for JSON: {summary: str, facts: [str]}
+      - Persist as carry_over {summary, memory_delta.notes}
+      - Mark ready_to_rollover
+    """
+    import re, json, asyncio
+
     cont_ref = db.collection("continuums").document(str(user_id))
     conv_id = f"u{user_id}:continuum"
     msg_ref = db.collection("conversations").document(conv_id).collection("messages")
 
-    # marker (optional)
-    await msg_ref.add({"timestamp": firestore.SERVER_TIMESTAMP, "role": "system",
-                       "type": "marker", "marker": "summarize_started", "generation": generation})
-
-    await asyncio.sleep(DUMMY_DELAY)
-    dummy_summary = "[here will be the actual summary]"
-    dummy_notes   = "[here will be the notes of previous conversation]"
-
-    await cont_ref.update({
-        "carry_over": {
-            "summary": dummy_summary,
-            "memory_delta": {"notes": dummy_notes},
-            "metadata": {}
-        },
-        "summarize_ready_at": firestore.SERVER_TIMESTAMP,
-        "status": "ready_to_rollover",
-        "updated_at": firestore.SERVER_TIMESTAMP,
+    # ---- Marker: summarization started ---------------------------------------
+    await msg_ref.add({
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "role": "system",
+        "type": "marker",
+        "marker": "summarize_started",
+        "generation": generation
     })
 
-    await msg_ref.add({"timestamp": firestore.SERVER_TIMESTAMP, "role": "system",
-                       "type": "marker", "marker": "summarize_ready", "generation": generation})
+    # Read summarize_started_at (set when SOFT limit tripped)
+    cont_doc = (await cont_ref.get()).to_dict() or {}
+    started_at = cont_doc.get("summarize_started_at")
+    if not started_at:
+        # Fallback: now (should be rare)
+        started_at = datetime.now(timezone.utc)
+        logger.warning("summarizer_task: missing summarize_started_at; defaulting to now",
+                       extra={"user_id": user_id})
 
-    payload = {}
-    if LOG_PAYLOADS:
-        payload = {"summary_snippet": _snippet(dummy_summary), "notes_snippet": _snippet(dummy_notes)}
-    await log_event_fs(user_id, "summarize_ready", payload)
+    # ---- Collect messages COVERAGE: everything <= started_at ------------------
+    # (Keeps your later 'tail' clean: tail is strictly > started_at)
+    # Query uses FieldFilter to avoid composite index; we filter type='message' in Python.
+    query = (
+        msg_ref
+        .where(filter=FieldFilter("timestamp", "<=", started_at))
+        .order_by("timestamp")
+    )
+    docs = [d async for d in query.stream()]
 
-    logger.info("summarize_ready", extra={
-        "user_id": user_id,
-        "generation": generation,
-        **({"summary_snippet": _snippet(dummy_summary),
-            "notes_snippet": _snippet(dummy_notes)} if LOG_PAYLOADS else {})
-    })
+    # Keep only real chat messages
+    msgs = []
+    for d in docs:
+        m = d.to_dict() or {}
+        if m.get("type") != "message":
+            continue
+        msgs.append((d.id, m))
 
+    # Build a token-bounded transcript, newest-last
+    lines, used_ids, first_ts, last_ts = [], [], None, None
+    budget = SUMMARIZER_MAX_INPUT_TOKENS
+    cur = 0
+    for doc_id, m in msgs:
+        ts = m.get("timestamp")
+        role = m.get("role", "user")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        line = f"[{doc_id}] {ts.isoformat() if hasattr(ts, 'isoformat') else ts} | {role.upper()}: {content}"
+        t = _approx_tokens(line)
+        if cur + t > budget and lines:
+            break
+        lines.append(line)
+        used_ids.append(doc_id)
+        cur += t
+        if not first_ts:
+            first_ts = ts
+        last_ts = ts
+
+    transcript = "\n".join(lines)
+    input_chars = len(transcript)
+
+    # ---- Call Gemini once (google-genai) -------------------------------------
+    try:
+        from google import genai
+        from google.genai import types
+
+        use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true"
+        if use_vertex:
+            client = genai.Client(
+                vertexai=True,
+                project=os.getenv("GCP_PROJECT_ID"),
+                location=os.getenv("GCP_LOCATION", "us-central1"),
+            )
+        else:
+            client = genai.Client(api_key=SUMMARIZER_API_KEY)
+
+        PROMPT = """You are a careful assistant that summarizes chat transcripts.
+Return ONLY JSON with this schema:
+{"summary": "5-10 sentences covering key points, decisions, and user intents",
+ "facts": ["bullet-level concrete facts & preferences; concise; no speculation"]}
+Rules:
+- Do NOT invent facts; stick to the transcript verbatim.
+- Prefer durable details (preferences, entities, decisions, numbers, dates).
+- Keep it neutral and concise.
+- If content is thin, return shorter output (empty 'facts' is OK).
+TRANSCRIPT:
+"""
+
+        def _call():
+            resp = client.models.generate_content(
+                model=SUMMARIZER_MODEL,
+                contents=[PROMPT, transcript],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "string"},
+                            "facts": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["summary", "facts"],
+                        "additionalProperties": False,
+                    },
+                    max_output_tokens=1024,
+                    temperature=0.2,
+                ),
+            )
+            return resp.text or ""
+
+        raw = await asyncio.to_thread(_call)
+
+        # ---- Parse JSON defensively ------------------------------------------
+        data = {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # Try to snip JSON from fences or extra prose
+            m = re.search(r"\{.*\}", raw, flags=re.S)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    pass
+
+        summary = (data.get("summary") or "").strip() if isinstance(data, dict) else ""
+        facts = data.get("facts") if isinstance(data, dict) else None
+
+        if not summary and not facts:
+            # Fallback: very small heuristic summary
+            head = (lines[0] if lines else "")[:300]
+            tail = (lines[-1] if lines else "")[:300]
+            summary = f"Conversation recap:\n- Opening: {head}\n- Latest: {tail}"
+            facts = []
+
+        notes = _to_notes(facts)
+
+        # ---- Persist carry_over (JSON-safe) and flip status -------------------
+        await cont_ref.update({
+            "carry_over": json_sanitize({
+                "summary": summary,
+                "memory_delta": {"notes": notes},
+                "metadata": {
+                    "model": SUMMARIZER_MODEL,
+                    "input_characters": input_chars,
+                    "used_message_count": len(used_ids),
+                    "coverage": {
+                        "from_ts": _ts_iso(first_ts),
+                        "to_ts": _ts_iso(last_ts),
+                        "message_ids": used_ids,
+                    },
+                    "prompt_version": "v1-single-pass-genai",
+                }
+            }),
+            "summarize_ready_at": firestore.SERVER_TIMESTAMP,
+            "status": "ready_to_rollover",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+
+        # Marker + logs
+        await msg_ref.add({
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "role": "system",
+            "type": "marker",
+            "marker": "summarize_ready",
+            "generation": generation
+        })
+
+        payload = {}
+        if LOG_PAYLOADS:
+            payload = {
+                "summary_snippet": _snippet(summary),
+                "notes_snippet": _snippet(notes),
+                "used_message_count": len(used_ids)
+            }
+        await log_event_fs(user_id, "summarize_ready", payload)
+
+        logger.info("summarize_ready", extra={
+            "user_id": user_id,
+            "generation": generation,
+            "used_message_count": len(used_ids),
+            **({"summary_snippet": _snippet(summary),
+                "notes_snippet": _snippet(notes)} if LOG_PAYLOADS else {})
+        })
+
+    except Exception as e:
+        logger.error("summarizer_task failed, falling back to dummy summary: %s", e, exc_info=True)
+        # Safe fallback so your pipeline still rolls forward
+        dummy_summary = "[automatic summary unavailable; using fallback]"
+        dummy_notes = ""
+        await cont_ref.update({
+            "carry_over": {
+                "summary": dummy_summary,
+                "memory_delta": {"notes": dummy_notes},
+                "metadata": {"error": str(e), "prompt_version": "v1-single-pass-genai", "fallback": True}
+            },
+            "summarize_ready_at": firestore.SERVER_TIMESTAMP,
+            "status": "ready_to_rollover",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        await msg_ref.add({
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "role": "system",
+            "type": "marker",
+            "marker": "summarize_ready",
+            "generation": generation
+        })
+        await log_event_fs(user_id, "summarize_ready", {
+            **({"summary_snippet": _snippet(dummy_summary)} if LOG_PAYLOADS else {})
+        })
