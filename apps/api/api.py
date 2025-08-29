@@ -3,7 +3,7 @@
 import os
 from uuid import uuid4
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional, Dict, Any
 
 # from dotenv import load_dotenv
 # load_dotenv(override=True)
@@ -22,6 +22,12 @@ from google.cloud import firestore
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 import google.auth
+
+
+from typing import Optional, Dict, Any
+import asyncio
+
+from google.cloud.firestore_v1 import FieldFilter  # for equality filters
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,6 +75,33 @@ class QueueResponse(BaseModel):
     conversation_id: str
 
 
+class SessionMeta(BaseModel):
+    session_id: str
+    generation: int = 0
+    status: str = "unknown"
+    start_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    is_active: bool = False
+
+class SessionListResponse(BaseModel):
+    user_id: int
+    active_session_id: Optional[str]
+    sessions: List[SessionMeta]
+
+class SessionIdResponse(BaseModel):
+    user_id: int
+    session: Optional[SessionMeta] = None
+
+class SessionViewResponse(BaseModel):
+    user_id: int
+    session: SessionMeta
+    # From the timeline "summary" entry
+    summary: Optional[str] = None
+    notes: Optional[str] = None
+    # Messages that belong to ONLY this session (hydrated from message_ref)
+    messages: List[ChatMessage]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ──────────────────────────────────────────────────────────────────────────────
@@ -102,6 +135,34 @@ db = firestore.AsyncClient(project=GCP_PROJECT_ID, database=FIRESTORE_DB)
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _continuum_id(user_id: int) -> str:
+    return f"u{user_id}:continuum"
+
+async def _get_active_session_id(user_id: int) -> Optional[str]:
+    cont_ref = db.collection("continuums").document(str(user_id))
+    snap = await cont_ref.get()
+    d = snap.to_dict() or {}
+    return d.get("active_session_id")
+
+async def _list_session_docs_for_user(user_id: int):
+    q = (
+        db.collection("sessions")
+        .where(filter=FieldFilter("user_id", "==", str(user_id)))
+    )
+    return [s async for s in q.stream()]
+
+def _session_meta_from_snap(snap, active_id: Optional[str]) -> SessionMeta:
+    d = snap.to_dict() or {}
+    return SessionMeta(
+        session_id=snap.id,
+        generation=int(d.get("generation", 0)),
+        status=d.get("status", "unknown"),
+        start_at=d.get("start_at"),
+        end_at=d.get("end_at"),
+        is_active=(snap.id == active_id),
+    )
+
 
 def continuum_id_for_user(user_id: int) -> str:
     """Single canonical conversation id the FE subscribes to."""
@@ -226,4 +287,135 @@ async def get_upload_url(req: UploadURLRequest):
         bucket=bucket_name,
         object_path=object_path,
         expires_at=datetime.utcnow() + timedelta(minutes=15),
+    )
+
+
+@app.get("/api/v1/sessions/{user_id}/list", response_model=SessionListResponse)
+async def list_sessions(user_id: int):
+    """
+    List all sessions for a user with minimal metadata and which one is active.
+    """
+    active_id = await _get_active_session_id(user_id)
+    snaps = await _list_session_docs_for_user(user_id)
+
+    # Sort in Python to avoid extra composite indexes:
+    # first by generation asc (oldest -> newest)
+    metas = sorted(
+        (_session_meta_from_snap(s, active_id) for s in snaps),
+        key=lambda m: m.generation,
+    )
+
+    return SessionListResponse(
+        user_id=user_id,
+        active_session_id=active_id,
+        sessions=metas,
+    )
+
+
+@app.get("/api/v1/sessions/{user_id}/active", response_model=SessionIdResponse)
+async def get_active_session(user_id: int):
+    """
+    Convenience endpoint to fetch metadata for the active session.
+    """
+    active_id = await _get_active_session_id(user_id)
+    if not active_id:
+        return SessionIdResponse(user_id=user_id, session=None)
+
+    # Read its doc for meta
+    sref = db.collection("sessions").document(active_id)
+    ssnap = await sref.get()
+    if not ssnap.exists:
+        return SessionIdResponse(user_id=user_id, session=None)
+
+    meta = _session_meta_from_snap(ssnap, active_id)
+    return SessionIdResponse(user_id=user_id, session=meta)
+
+
+@app.get("/api/v1/sessions/{user_id}/previous", response_model=SessionIdResponse)
+async def get_previous_session(user_id: int):
+    """
+    Convenience endpoint to fetch the session *before* the active one by generation.
+    """
+    active_id = await _get_active_session_id(user_id)
+    snaps = await _list_session_docs_for_user(user_id)
+    metas = sorted(
+        (_session_meta_from_snap(s, active_id) for s in snaps),
+        key=lambda m: m.generation,
+    )
+
+    if not active_id or not metas:
+        return SessionIdResponse(user_id=user_id, session=None)
+
+    # Find active, then pick previous by generation
+    idx = next((i for i, m in enumerate(metas) if m.session_id == active_id), None)
+    if idx is None or idx == 0:
+        return SessionIdResponse(user_id=user_id, session=None)
+
+    return SessionIdResponse(user_id=user_id, session=metas[idx - 1])
+
+
+@app.get("/api/v1/sessions/{user_id}/{session_id}/view", response_model=SessionViewResponse)
+async def get_session_view(user_id: int, session_id: str):
+    """
+    Hydrated session 'view':
+      - meta (status, generation, start/end)
+      - the latest 'summary' entry (plus memory_delta.notes) from the timeline
+      - only the messages that belong to this session, ordered by timeline ts
+    """
+    # Meta
+    sref = db.collection("sessions").document(session_id)
+    ssnap = await sref.get()
+    if not ssnap.exists:
+        raise RuntimeError("Session not found")
+
+    active_id = await _get_active_session_id(user_id)
+    meta = _session_meta_from_snap(ssnap, active_id)
+
+    # Timeline (ordered by ts asc)
+    t_ref = sref.collection("timeline")
+    t_docs = [d async for d in t_ref.order_by("ts").stream()]
+
+    # Collect message ids in timeline order and capture summary/notes
+    message_ids: List[str] = []
+    summary_text: Optional[str] = None
+    notes_text: Optional[str] = None
+
+    for d in t_docs:
+        item = d.to_dict() or {}
+        kind = item.get("kind")
+        if kind == "message_ref":
+            mid = item.get("message_id")
+            if mid:
+                message_ids.append(mid)
+        elif kind == "summary":
+            # Prefer the *last* summary we see in order (latest one)
+            summary_text = (item.get("summary") or "") or summary_text
+            md = item.get("memory_delta") or {}
+            notes_text = (md.get("notes") or "") or notes_text
+
+    # Hydrate message docs from the evergreen continuum
+    conv_id = _continuum_id(user_id)
+    mcoll = db.collection("conversations").document(conv_id).collection("messages")
+
+    async def _fetch_msg(mid: str):
+        snap = await mcoll.document(mid).get()
+        d = snap.to_dict() or {}
+        return ChatMessage(
+            timestamp=d.get("timestamp"),
+            role=d.get("role", "assistant"),
+            content=d.get("content", ""),
+            attachments=d.get("attachments") or [],
+        )
+
+    # Preserve order from timeline
+    msgs: List[ChatMessage] = []
+    if message_ids:
+        msgs = await asyncio.gather(*[_fetch_msg(mid) for mid in message_ids])
+
+    return SessionViewResponse(
+        user_id=user_id,
+        session=meta,
+        summary=summary_text,
+        notes=notes_text,
+        messages=msgs,
     )

@@ -268,6 +268,20 @@ async def maybe_start_summarizer(user_id: int, add_tokens: int) -> None:
         await summarizer_task.kiq(user_id=user_id, generation=int(cur.get("generation", 0)))
 
 
+async def publish_status(ordering_key: str, event: str, **fields) -> None:
+    """
+    Send a named control event to Redis (awaited) so it arrives before chunks.
+    event: 'status' | 'done' | 'error' (your choice)
+    """
+    if not redis_stream:
+        return
+    payload = {
+        "event": event,
+        "data": {**fields},
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    # Await to guarantee ordering relative to upcoming chunk tasks
+    await redis_stream.publish(ordering_key, json.dumps(payload))
 
 
 # Only create the client if a host is configured — keeps code harmless
@@ -294,10 +308,18 @@ async def process_message_task(
     message: str,
     attachments: list[dict] | None = None,
 ) -> None:
+    
+    
+   
+
     conv_id = continuum_id(user_id)
     convo_doc_ref = db.collection("conversations").document(conv_id)
     msg_ref = convo_doc_ref.collection("messages")
     cont_ref = db.collection("continuums").document(str(user_id))
+
+       # 🔔 immediately tell the UI we’re thinking
+    
+
 
     # 1) Ensure control-plane + ADK session
     session_id = await ensure_active_session_or_restore(user_id)
@@ -311,6 +333,16 @@ async def process_message_task(
     # 3) Persist the user message to evergreen timeline immediately
     user_msg_id = str(uuid.uuid4())
     user_msg_doc = msg_ref.document(user_msg_id)
+
+    await publish_status(
+        conv_id, "status",
+        phase="started",                 # or "thinking"
+        user_id=str(user_id),
+        user_message_id=user_msg_id,     # you’ll use this same id when you persist the message
+    )
+
+    await asyncio.sleep(5)
+
     await user_msg_doc.set({
         "timestamp": firestore.SERVER_TIMESTAMP,
         "role": "user",
