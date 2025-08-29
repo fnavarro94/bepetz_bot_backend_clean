@@ -121,7 +121,12 @@ async def log_event_fs(user_id: int, event: str, data: dict | None = None):
         })
 
 
-
+async def _fetch_pets(user_id: int) -> dict:
+    try:
+        return await get_all_pet_details_by_user_id(user_id) or {}
+    except Exception as e:
+        logger.warning("pet_fetch_failed", extra={"user_id": user_id, "err": str(e)})
+        return {}
 # Helper to log usage from Firestore control-plane
 async def log_session_usage(user_id: int, session_id: str, note: str = ""):
     cont_ref = db.collection("continuums").document(str(user_id))
@@ -151,9 +156,14 @@ async def ensure_active_session_or_restore(user_id: int) -> str:
 
     if not sid:
         # First time for this user: seed metadata (e.g., pets) and create session
-        init_state = {"info_mascotas": await get_all_pet_details_by_user_id(user_id) or {}}
+         # First time for this user: fetch pets from DB ONLY
+        init_state = {
+            "info_mascotas": await _fetch_pets(user_id),
+            "generation": 0,
+        }
         sid = (await create_session(str(user_id), state=init_state))["id"]
-        await ensure_session(sid, str(user_id), state={"generation": 0})
+        # Do NOT pass state here to avoid accidental overwrite of info_mascotas
+        await ensure_session(sid, str(user_id))
 
         await cont_ref.set({
             "user_id": str(user_id),
@@ -194,6 +204,10 @@ async def ensure_active_session_or_restore(user_id: int) -> str:
         state_seed = {"generation": data.get("generation", 0)}
         if carry_over:
             state_seed["carry_over"] = carry_over
+
+        # ↓ NEW: prefer cached pets from control-plane, fallback to DB
+        pets = await _fetch_pets(user_id)
+        state_seed["info_mascotas"] = pets
 
         new_sid = (await create_session(str(user_id), state=state_seed))["id"]
         await ensure_session(new_sid, str(user_id))
@@ -412,7 +426,15 @@ async def process_message_task(
         })
 
         # Create & ensure new ADK session seeded with summary + tail
-        seed_state = {"carry_over": carry_over, "generation": generation + 1, "tail": tail}
+        # ↓↓↓ ADD THESE TWO LINES (fresh fetch + optional cache) ↓↓↓
+        pets = await _fetch_pets(user_id)
+        seed_state = {
+            "carry_over": carry_over,
+            "generation": generation + 1,
+            "tail": tail,
+            "info_mascotas": pets,
+        }
+
         new_sid = (await create_session(str(user_id), state=seed_state))["id"]
         await ensure_session(new_sid, str(user_id))
 
@@ -573,7 +595,8 @@ async def process_message_task(
     # 7) Persist assistant message
     full_reply = "".join(full_reply_parts)
     if full_reply:
-        bot_doc = await msg_ref.add({
+        bot_msg_ref = msg_ref.document()  # auto-ID (or use uuid4 like the user message)
+        await bot_msg_ref.set({
             "timestamp": firestore.SERVER_TIMESTAMP,
             "role": "assistant",
             "content": full_reply,
@@ -587,7 +610,7 @@ async def process_message_task(
         await db.collection("sessions").document(session_id).collection("timeline").add({
             "ts": firestore.SERVER_TIMESTAMP,
             "kind": "message_ref",
-            "message_id": bot_doc.id,
+            "message_id": bot_msg_ref.id,
             "role": "assistant",
             "generation": generation,
         })
