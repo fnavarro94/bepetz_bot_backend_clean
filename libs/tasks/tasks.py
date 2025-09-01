@@ -466,11 +466,14 @@ async def process_message_task(
         tail_safe       = json_sanitize(tail)
         pets_safe       = json_sanitize(pets)
         seed_state = {
-            "carry_over": carry_over_safe,
-            "generation": generation + 1,
-            "tail": tail_safe,
             "info_mascotas": pets_safe,
+            "summary": (carry_over_safe or {}).get("summary", ""),
+            "notes": ((carry_over_safe or {}).get("memory_delta") or {}).get("notes", ""),
+            "tail": "\n".join(f"- [{m.get('role','').upper()}] {m.get('content','')}" for m in tail_safe) if tail_safe else "",
+            "generation": generation + 1,
+            "carry_over": carry_over_safe,  # keep original too, if you still want it elsewhere
         }
+
 
         new_sid = (await create_session(str(user_id), state=seed_state))["id"]
         await ensure_session(new_sid, str(user_id))
@@ -738,6 +741,12 @@ from google.cloud.firestore_v1.base_query import FieldFilter  # query fix
 SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gemini-2.0-flash-001")
 SUMMARIZER_MAX_INPUT_TOKENS = int(os.getenv("SUMMARIZER_MAX_INPUT_TOKENS", "8000"))
 
+NOTES_EXTRACTOR_MODEL = os.getenv("NOTES_EXTRACTOR_MODEL", SUMMARIZER_MODEL)
+NOTES_MAX_OUTPUT_TOKENS = int(os.getenv("NOTES_MAX_OUTPUT_TOKENS", "512"))
+
+CARRY_OVER_LAST_N = int(os.getenv("CARRY_OVER_LAST_N", "6"))          # how many recent messages to append
+CARRY_OVER_LAST_N_SNIPPET = int(os.getenv("CARRY_OVER_LAST_N_SNIPPET", "180"))  # chars per message
+
 # Developer API key (Gemini Developer API). For Vertex, set GOOGLE_GENAI_USE_VERTEXAI=true
 # and GCP_PROJECT_ID/GCP_LOCATION; leave this empty.
 SUMMARIZER_API_KEY = os.getenv("GOOGLE_API_KEY", "")
@@ -798,6 +807,89 @@ def json_sanitize(obj):
     if isinstance(obj, tuple):
         return [json_sanitize(v) for v in obj]
     return obj
+
+
+# ↓↓↓ ADD THIS HELPER ↓↓↓
+def _build_last_n_block(msgs: list[tuple[str, dict]], n: int, max_chars: int = 180):
+    """
+    msgs: list of (doc_id, message_dict) ordered oldest→newest (as built above).
+    Returns: (block_text, last_ids)
+    """
+    if n <= 0 or not msgs:
+        return "", []
+    recent = msgs[-n:]
+    lines, ids = [], []
+    for doc_id, m in recent:
+        if m.get("type") == "message":  # already filtered, but double-check
+            role = m.get("role", "user").upper()
+            txt = _snippet(m.get("content", ""), max_chars)
+            if txt:
+                lines.append(f"- [{role}] {txt}")
+                ids.append(doc_id)
+    return ("\n".join(lines) if lines else ""), ids
+
+async def _extract_notes(client, summary: str, transcript: str) -> list[str]:
+    """
+    Given the SUMMARY and bounded TRANSCRIPT, extract a concise set of
+    high-signal NOTES for continuity. Returns list[str] (empty on failure).
+    """
+    import json, re, asyncio
+    from google.genai import types
+
+    PROMPT = """You extract durable, high-signal conversation NOTES for continuity.
+Return ONLY JSON:
+{"notes": ["short, factual, durable bullets (5-15 items)"]}
+
+Guidelines:
+- Capture facts/preferences/constraints that matter later (names, roles, goals,
+  ongoing tasks, deadlines, decisions, integrations, settings, pet details).
+- Prefer stable items over small talk. No speculation or duplication.
+- Only use information present in the transcript/summary.
+- Each item ≤ 140 characters; clear and canonical.
+
+Inputs:
+1) SUMMARY: trustworthy recap.
+2) TRANSCRIPT: raw bounded lines.
+Output the best canonical NOTES."""
+
+    def _call():
+        resp = client.models.generate_content(
+            model=NOTES_EXTRACTOR_MODEL,
+            contents=[PROMPT, f"SUMMARY:\n{summary}\n\nTRANSCRIPT:\n{transcript}"],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "notes": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["notes"],
+                    "additionalProperties": False,
+                },
+                max_output_tokens=NOTES_MAX_OUTPUT_TOKENS,
+                temperature=0.1,
+            ),
+        )
+        return resp.text or ""
+
+    raw = await asyncio.to_thread(_call)
+
+    try:
+        data = json.loads(raw)
+        notes = data.get("notes")
+        if isinstance(notes, list):
+            return [str(n).strip() for n in notes if str(n).strip()]
+    except Exception:
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                notes = data.get("notes")
+                if isinstance(notes, list):
+                    return [str(n).strip() for n in notes if str(n).strip()]
+            except Exception:
+                pass
+    return []
 
 
 @broker.task
@@ -948,13 +1040,33 @@ TRANSCRIPT:
             summary = f"Conversation recap:\n- Opening: {head}\n- Latest: {tail}"
             facts = []
 
-        notes = _to_notes(facts)
+        # NEW: second pass using both summary + transcript to extract continuity NOTES
+        notes_list = await _extract_notes(client, summary=summary, transcript=transcript)
+
+        # Keep bullet formatting consistent with existing storage
+        if notes_list:
+            notes = _to_notes(notes_list)   # pretty bullet list string
+            notes_source = "notes_extractor"
+        else:
+            # graceful fallback to the 'facts' from the summarizer JSON
+            notes = _to_notes(facts)
+            notes_source = "summarizer_facts_fallback"
+
+        # ↓↓↓ ADD THIS BLOCK ↓↓↓
+        last_n_block, last_n_ids = _build_last_n_block(msgs, CARRY_OVER_LAST_N, CARRY_OVER_LAST_N_SNIPPET)
+        if last_n_block:
+            # Append to SUMMARY (with a small header)
+            #summary = f"{summary}\n\nRecent messages (last {len(last_n_ids)}):\n{last_n_block}"
+
+            # Append to NOTES (no header; keep it bullet-style and compact)
+            notes = f"{notes}\n Los ultimos mensajes de la conversacion fueron: \n {last_n_block}" if notes else last_n_block
+
 
         # ---- Persist carry_over (JSON-safe) and flip status -------------------
         await cont_ref.update({
             "carry_over": json_sanitize({
                 "summary": summary,
-                "memory_delta": {"notes": notes},
+                "memory_delta": {"notes": notes},  # storage path unchanged for compatibility
                 "metadata": {
                     "model": SUMMARIZER_MODEL,
                     "input_characters": input_chars,
@@ -965,6 +1077,14 @@ TRANSCRIPT:
                         "message_ids": used_ids,
                     },
                     "prompt_version": "v1-single-pass-genai",
+                    "notes_extractor_model": NOTES_EXTRACTOR_MODEL,
+                    "notes_source": notes_source,
+                    # ↓↓↓ ADD THIS ↓↓↓
+                    "last_n_appended": {
+                        "count": len(last_n_ids),
+                        "snippet_chars": CARRY_OVER_LAST_N_SNIPPET,
+                        "message_ids": last_n_ids,
+                    },
                 }
             }),
             "summarize_ready_at": firestore.SERVER_TIMESTAMP,
