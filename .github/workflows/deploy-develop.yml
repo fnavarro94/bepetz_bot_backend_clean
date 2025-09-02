@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        app: [api, worker, relay]
+        app: [api, worker, relay, vet_worker]  # added vet_worker
 
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +76,6 @@ jobs:
           gcloud artifacts docker tags add "$IMAGE_SHA" "$IMAGE_LATEST" \
             --project="${{ vars.GCP_PROJECT_ID }}"
 
-
-
       - name: Resolve Redis endpoint
         id: redis
         run: |
@@ -110,7 +108,9 @@ jobs:
       - name: Deploy to Cloud Run
         run: |
           set -euo pipefail
-          SERVICE="chatbot-${{ matrix.app }}"
+          APP_SLUG="${{ matrix.app }}"
+          # Cloud Run service names cannot contain underscores; convert to hyphen
+          SERVICE="chatbot-$(echo "$APP_SLUG" | tr '_' '-')"
           echo "Deploying $SERVICE with image: $IMAGE_TO_USE"
 
           BASE="--project ${{ vars.GCP_PROJECT_ID }} \
@@ -136,7 +136,7 @@ jobs:
           GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
           DATABASE_URL=${{ secrets.DATABASE_URL }}"
 
-          if [ "${{ matrix.app }}" = "api" ] || [ "${{ matrix.app }}" = "relay" ]; then
+          if [ "$APP_SLUG" = "api" ] || [ "$APP_SLUG" = "relay" ]; then
             gcloud run deploy "$SERVICE" $BASE --allow-unauthenticated --min-instances=1 --set-env-vars "$ENV"
           else
             gcloud run deploy "$SERVICE" $BASE --no-allow-unauthenticated --cpu=2 --no-cpu-throttling --cpu-boost --memory=1Gi --min-instances=1 --set-env-vars "$ENV"

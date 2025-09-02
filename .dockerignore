@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Git & IDE
+.git
+.gitignore
+*.swp
+*.swo
+.vscode/
+
+# Node
+node_modules/
+
+# Other
+*.log

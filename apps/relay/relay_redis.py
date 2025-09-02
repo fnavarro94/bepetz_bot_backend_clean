@@ -1,19 +1,24 @@
 # ==============================================================================
 # File: relay_redis.py  –  SSE + Redis Pub/Sub (user_id & conversation_id in path)
-# Purpose:  ▸ Whenever the first browser connects for a conversation
-#           ▸ SUBSCRIBE to that Redis channel (`chat:<conversation_id>`)
-#           ▸ Push every token chunk to the SSE client(s)
-#           ▸ If the last client disconnects, UNSUBSCRIBE + cancel task
+# Purpose:  ▸ When the first browser connects for a conversation, SUBSCRIBE to
+#             that Redis channel (`<conversation_id>`)
+#           ▸ Fan-out each message to all connected SSE clients for that convo
+#           ▸ When the last client disconnects, UNSUBSCRIBE + cancel task
 # ==============================================================================
 
-import os, logging, asyncio, janus
-from typing import Dict, Tuple
+import os
+import json
+import logging
+import asyncio
+import janus
+from typing import Dict, List, Tuple
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette import EventSourceResponse
-import redis.asyncio as aioredis      # ← NEW (async Redis client)
+import redis.asyncio as aioredis
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
 
 # ── CONFIG ─────────────────────────────────────────────────────────────
@@ -24,8 +29,10 @@ STREAM_REDIS_PORT = int(os.getenv("STREAM_REDIS_PORT", "6379"))
 STREAM_REDIS_SSL  = os.getenv("STREAM_REDIS_SSL", "false").lower() == "true"
 
 # ── LOGGING ────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format="[%(asctime)s][%(levelname)s][relay-redis] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s][%(levelname)s][relay-redis] %(message)s"
+)
 log = logging.getLogger("relay-redis")
 
 # ── FASTAPI APP ────────────────────────────────────────────────────────
@@ -36,7 +43,6 @@ ALLOWED_ORIGINS = [
     "https://bepetz-chatbot-ui-dev.web.app",
     # "https://bepetz-chatbot-ui-dev--felipe-preview.web.app",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -44,6 +50,14 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+# ── GLOBAL REDIS CLIENT (shared) ───────────────────────────────────────
+redis_stream = aioredis.Redis(
+    host=STREAM_REDIS_HOST,
+    port=STREAM_REDIS_PORT,
+    ssl=STREAM_REDIS_SSL,
+    encoding="utf-8",
+    decode_responses=True,  # get strings instead of bytes
+)
 
 @app.on_event("startup")
 async def _startup():
@@ -55,58 +69,141 @@ async def _startup():
     except Exception as e:
         log.error("Redis PING FAILED: %s", e, exc_info=True)
 
-# ── GLOBAL REDIS CLIENT (shared) ───────────────────────────────────────
-redis_stream = aioredis.Redis(
-    host=STREAM_REDIS_HOST,
-    port=STREAM_REDIS_PORT,
-    ssl=STREAM_REDIS_SSL,
-    encoding="utf-8",
-    decode_responses=True,
-)
-
 # ── REGISTRIES ─────────────────────────────────────────────────────────
-#  conversation_id ➜ (janus.Queue, owning_event_loop)
-CLIENTS:   Dict[str, Tuple[janus.Queue, asyncio.AbstractEventLoop]] = {}
-#  conversation_id ➜ background Redis listener task
+# conversation_id ➜ list of (janus.Queue, owning_event_loop)
+CLIENTS: Dict[str, List[Tuple[janus.Queue, asyncio.AbstractEventLoop]]] = {}
+# conversation_id ➜ background Redis listener task
 SUB_TASKS: Dict[str, asyncio.Task] = {}
+
+
+async def _sse_for_channel(channel_name: str, attach_label: str = ""):
+    """
+    Generic SSE streamer for any Redis Pub/Sub channel.
+    Manages: client registry, lazy subscribe, fanout, and cleanup.
+    """
+    q    = janus.Queue()
+    loop = asyncio.get_running_loop()
+    CLIENTS.setdefault(channel_name, []).append((q, loop))
+
+    # Start one background Redis listener per channel
+    if channel_name not in SUB_TASKS:
+        async def fanout():
+            pubsub = redis_stream.pubsub()
+            await pubsub.subscribe(channel_name)
+            log.info("🔗 SUBSCRIBE %s (task started)", channel_name)
+            try:
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    data = msg.get("data")
+                    for queue, _lp in list(CLIENTS.get(channel_name, [])):
+                        try:
+                            queue.async_q.put_nowait(data)
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                pass
+            finally:
+                try:
+                    await pubsub.unsubscribe(channel_name)
+                    await pubsub.close()
+                finally:
+                    log.info("⏏︎ UNSUB %s", channel_name)
+
+        SUB_TASKS[channel_name] = asyncio.create_task(fanout())
+
+    log.info("👋 attach  %s channel=%s", attach_label or "client", channel_name)
+
+    async def event_gen():
+        try:
+            while True:
+                raw = await q.async_q.get()
+
+                # map sentinel used by chat flow (safe to keep)
+                if isinstance(raw, str) and raw.strip() == "[END-OF-STREAM]":
+                    yield {"event": "done", "data": "{}"}
+                    yield {"data": raw}
+                    continue
+
+                # forward structured control envelopes as named SSE events
+                obj = None
+                if isinstance(raw, str) and raw and raw[0] in "{[":
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        obj = None
+
+                if isinstance(obj, dict) and "event" in obj:
+                    evt = str(obj["event"])
+                    payload = obj.get("data", {})
+                    try:
+                        payload_str = json.dumps(payload)
+                    except Exception:
+                        payload_str = "{}"
+                    yield {"event": evt, "data": payload_str}
+                    continue
+
+                # otherwise stream as plain chunk
+                yield {"data": raw}
+        finally:
+            clients = CLIENTS.get(channel_name, [])
+            try:
+                clients.remove((q, loop))
+            except ValueError:
+                pass
+            if not clients:
+                CLIENTS.pop(channel_name, None)
+                task = SUB_TASKS.pop(channel_name, None)
+                if task:
+                    task.cancel()
+            await q.aclose()
+            log.info("👋 detach %s channel=%s", attach_label or "client", channel_name)
+
+    return EventSourceResponse(
+        event_gen(),
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
 
 # ── SSE ENDPOINT ───────────────────────────────────────────────────────
 @app.get("/stream/{user_id}/{conversation_id}")
 async def stream(user_id: str, conversation_id: str):
     """
-    – When the first browser calls this endpoint we:
-        * create a janus.Queue
-        * register it in CLIENTS
-        * start (lazily) a Redis SUBSCRIBE task for that conversation
-    – When the last browser disconnects we:
-        * remove the queue
-        * cancel the Redis task (which auto-UNSUBSCRIBEs)
+    For each connection:
+      • Create a janus.Queue and register it under the conversation.
+      • Lazily start the Redis SUBSCRIBE loop once per conversation.
+      • Yield SSE events from the queue until the client disconnects.
     """
     q    = janus.Queue()
     loop = asyncio.get_running_loop()
-    CLIENTS[conversation_id] = (q, loop)
+    CLIENTS.setdefault(conversation_id, []).append((q, loop))
 
     # ── LAZY SUBSCRIBE – start once per conversation ───────────────────
     if conversation_id not in SUB_TASKS:
         async def fanout():
             pubsub = redis_stream.pubsub()
             await pubsub.subscribe(conversation_id)
-            log.info("🔗 SUBSCRIBE chat:%s  (task started)", conversation_id)  # add this
-            log.info("🔗 SUBSCRIBE chat:%s", conversation_id)
+            log.info("🔗 SUBSCRIBE %s  (task started)", conversation_id)
             try:
                 async for msg in pubsub.listen():
-                    if msg["type"] != "message":
+                    if msg.get("type") != "message":
                         continue
-                    data = msg["data"]
-                    pair = CLIENTS.get(conversation_id)
-                    if pair:
-                        pair[0].async_q.put_nowait(data)
+                    data = msg.get("data")
+                    # snapshot list to avoid mutation during iteration
+                    for queue, _lp in list(CLIENTS.get(conversation_id, [])):
+                        try:
+                            queue.async_q.put_nowait(data)
+                        except Exception:
+                            # if queue is closed, ignore
+                            pass
             except asyncio.CancelledError:
                 pass
             finally:
-                await pubsub.unsubscribe(conversation_id)
-                await pubsub.close()
-                log.info("⏏︎ UNSUB chat:%s", conversation_id)
+                try:
+                    await pubsub.unsubscribe(conversation_id)
+                    await pubsub.close()
+                finally:
+                    log.info("⏏︎ UNSUB %s", conversation_id)
 
         SUB_TASKS[conversation_id] = asyncio.create_task(fanout())
 
@@ -115,24 +212,87 @@ async def stream(user_id: str, conversation_id: str):
     async def event_gen():
         try:
             while True:
-                chunk = await q.async_q.get()
-                yield {"data": chunk}
+                raw = await q.async_q.get()  # str (decode_responses=True)
+
+                # 1) Map sentinel to a named 'done' event (and also keep raw for back-compat)
+                if isinstance(raw, str) and raw.strip() == "[END-OF-STREAM]":
+                    yield {"event": "done", "data": "{}"}
+                    yield {"data": raw}
+                    continue
+
+                # 2) Interpret control envelopes as named SSE events:
+                #    {"event": "status", "data": {...}}
+                obj = None
+                if isinstance(raw, str) and raw and raw[0] in "{[":
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        obj = None
+
+                if isinstance(obj, dict) and "event" in obj:
+                    evt = str(obj["event"])
+                    payload = obj.get("data", {})
+                    try:
+                        payload_str = json.dumps(payload)
+                    except Exception:
+                        payload_str = "{}"
+                    yield {"event": evt, "data": payload_str}
+                    continue
+
+                # 3) Fallback: treat as a normal token chunk
+                yield {"data": raw}
+
         finally:
             # Browser closed SSE connection
-            CLIENTS.pop(conversation_id, None)
+            # Remove this client's queue
+            clients = CLIENTS.get(conversation_id, [])
+            try:
+                clients.remove((q, loop))
+            except ValueError:
+                pass
+            if not clients:
+                CLIENTS.pop(conversation_id, None)
+                # If nobody else is listening → stop Redis task
+                task = SUB_TASKS.pop(conversation_id, None)
+                if task:
+                    task.cancel()
             await q.aclose()
-            # If nobody else is listening → stop Redis task
-            if conversation_id not in CLIENTS and conversation_id in SUB_TASKS:
-                SUB_TASKS.pop(conversation_id).cancel()
             log.info("👋 detach  conv=%s user=%s", conversation_id, user_id)
 
     return EventSourceResponse(
-                                event_gen(),
-                                headers={
-                                    "Cache-Control": "no-cache, no-transform",
-                                    "X-Accel-Buffering": "no",  # helps prevent proxy buffering
-                                },
-                            )
+        event_gen(),
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # helps prevent proxy buffering
+        },
+    )
+
+
+# ── VET WORKFLOW SSE ENDPOINTS ─────────────────────────────────────────
+# Worker publishes to:
+#   • vet:{session_id}                         (all vet events)
+#   • vet:{session_id}:{kind}                  (optional per-workflow channel)
+# where kind ∈ {"diagnostics","additional_exams","prescription","complementary_treatments"}
+
+@app.get("/vet-stream/{session_id}")
+async def vet_stream(session_id: str):
+    """
+    Subscribe to all vet events for this session id.
+    """
+    channel = f"vet:{session_id}"
+    return await _sse_for_channel(channel, attach_label=f"vet-session {session_id}")
+
+
+@app.get("/vet-stream/{session_id}/{kind}")
+async def vet_stream_kind(session_id: str, kind: str):
+    """
+    Subscribe to a specific vet workflow channel (e.g., diagnostics).
+    Frontend can call: /vet-stream/{session_id}/diagnostics
+    """
+    channel = f"vet:{session_id}:{kind}"
+    return await _sse_for_channel(channel, attach_label=f"vet-{kind} {session_id}")
+
+
 
 # ── RUN ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
