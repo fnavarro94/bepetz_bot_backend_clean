@@ -75,6 +75,96 @@ CLIENTS: Dict[str, List[Tuple[janus.Queue, asyncio.AbstractEventLoop]]] = {}
 # conversation_id ➜ background Redis listener task
 SUB_TASKS: Dict[str, asyncio.Task] = {}
 
+
+async def _sse_for_channel(channel_name: str, attach_label: str = ""):
+    """
+    Generic SSE streamer for any Redis Pub/Sub channel.
+    Manages: client registry, lazy subscribe, fanout, and cleanup.
+    """
+    q    = janus.Queue()
+    loop = asyncio.get_running_loop()
+    CLIENTS.setdefault(channel_name, []).append((q, loop))
+
+    # Start one background Redis listener per channel
+    if channel_name not in SUB_TASKS:
+        async def fanout():
+            pubsub = redis_stream.pubsub()
+            await pubsub.subscribe(channel_name)
+            log.info("🔗 SUBSCRIBE %s (task started)", channel_name)
+            try:
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    data = msg.get("data")
+                    for queue, _lp in list(CLIENTS.get(channel_name, [])):
+                        try:
+                            queue.async_q.put_nowait(data)
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                pass
+            finally:
+                try:
+                    await pubsub.unsubscribe(channel_name)
+                    await pubsub.close()
+                finally:
+                    log.info("⏏︎ UNSUB %s", channel_name)
+
+        SUB_TASKS[channel_name] = asyncio.create_task(fanout())
+
+    log.info("👋 attach  %s channel=%s", attach_label or "client", channel_name)
+
+    async def event_gen():
+        try:
+            while True:
+                raw = await q.async_q.get()
+
+                # map sentinel used by chat flow (safe to keep)
+                if isinstance(raw, str) and raw.strip() == "[END-OF-STREAM]":
+                    yield {"event": "done", "data": "{}"}
+                    yield {"data": raw}
+                    continue
+
+                # forward structured control envelopes as named SSE events
+                obj = None
+                if isinstance(raw, str) and raw and raw[0] in "{[":
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        obj = None
+
+                if isinstance(obj, dict) and "event" in obj:
+                    evt = str(obj["event"])
+                    payload = obj.get("data", {})
+                    try:
+                        payload_str = json.dumps(payload)
+                    except Exception:
+                        payload_str = "{}"
+                    yield {"event": evt, "data": payload_str}
+                    continue
+
+                # otherwise stream as plain chunk
+                yield {"data": raw}
+        finally:
+            clients = CLIENTS.get(channel_name, [])
+            try:
+                clients.remove((q, loop))
+            except ValueError:
+                pass
+            if not clients:
+                CLIENTS.pop(channel_name, None)
+                task = SUB_TASKS.pop(channel_name, None)
+                if task:
+                    task.cancel()
+            await q.aclose()
+            log.info("👋 detach %s channel=%s", attach_label or "client", channel_name)
+
+    return EventSourceResponse(
+        event_gen(),
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── SSE ENDPOINT ───────────────────────────────────────────────────────
 @app.get("/stream/{user_id}/{conversation_id}")
 async def stream(user_id: str, conversation_id: str):
@@ -176,6 +266,33 @@ async def stream(user_id: str, conversation_id: str):
             "X-Accel-Buffering": "no",  # helps prevent proxy buffering
         },
     )
+
+
+# ── VET WORKFLOW SSE ENDPOINTS ─────────────────────────────────────────
+# Worker publishes to:
+#   • vet:{session_id}                         (all vet events)
+#   • vet:{session_id}:{kind}                  (optional per-workflow channel)
+# where kind ∈ {"diagnostics","additional_exams","prescription","complementary_treatments"}
+
+@app.get("/vet-stream/{session_id}")
+async def vet_stream(session_id: str):
+    """
+    Subscribe to all vet events for this session id.
+    """
+    channel = f"vet:{session_id}"
+    return await _sse_for_channel(channel, attach_label=f"vet-session {session_id}")
+
+
+@app.get("/vet-stream/{session_id}/{kind}")
+async def vet_stream_kind(session_id: str, kind: str):
+    """
+    Subscribe to a specific vet workflow channel (e.g., diagnostics).
+    Frontend can call: /vet-stream/{session_id}/diagnostics
+    """
+    channel = f"vet:{session_id}:{kind}"
+    return await _sse_for_channel(channel, attach_label=f"vet-{kind} {session_id}")
+
+
 
 # ── RUN ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

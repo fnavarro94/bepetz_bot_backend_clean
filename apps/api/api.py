@@ -29,6 +29,21 @@ import asyncio
 
 from google.cloud.firestore_v1 import FieldFilter  # for equality filters
 
+# ── New: Vet workflow tasks (Diagnostics / Exams / Prescription / Complementary) ──
+try:
+    # when the new worker file is added (below), these imports will resolve
+    from vet_tasks.vet_tasks import (
+        run_diagnostics_task,
+        run_additional_exams_task,
+        run_prescription_task,
+        run_complementary_treatments_task,
+    )
+except Exception:
+    # Safe fallback so API can start even if worker file isn't deployed yet.
+    run_diagnostics_task = None
+    run_additional_exams_task = None
+    run_prescription_task = None
+    run_complementary_treatments_task = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pydantic models
@@ -100,6 +115,13 @@ class SessionViewResponse(BaseModel):
     notes: Optional[str] = None
     # Messages that belong to ONLY this session (hydrated from message_ref)
     messages: List[ChatMessage]
+
+class VetQueueResponse(BaseModel):
+    status: str
+    task_id: str
+    session_id: str
+    kind: str  # "diagnostics" | "additional_exams" | "prescription" | "complementary_treatments"
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -419,3 +441,40 @@ async def get_session_view(user_id: int, session_id: str):
         notes=notes_text,
         messages=msgs,
     )
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet workflow queueing endpoints (independent from chat flow)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/vet/{session_id}/diagnostics/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+async def queue_vet_diagnostics(session_id: str):
+    if not run_diagnostics_task:
+        raise RuntimeError("Diagnostics worker not available. Did you deploy tasks/vet_tasks.py?")
+    task = await run_diagnostics_task.kiq(session_id=session_id)
+    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="diagnostics")
+
+
+@app.post("/api/v1/vet/{session_id}/additional-exams/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+async def queue_vet_additional_exams(session_id: str):
+    if not run_additional_exams_task:
+        raise RuntimeError("Additional-exams worker not available. Did you deploy tasks/vet_tasks.py?")
+    task = await run_additional_exams_task.kiq(session_id=session_id)
+    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="additional_exams")
+
+
+@app.post("/api/v1/vet/{session_id}/prescription/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+async def queue_vet_prescription(session_id: str):
+    if not run_prescription_task:
+        raise RuntimeError("Prescription worker not available. Did you deploy tasks/vet_tasks.py?")
+    task = await run_prescription_task.kiq(session_id=session_id)
+    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="prescription")
+
+
+@app.post("/api/v1/vet/{session_id}/complementary-treatments/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+async def queue_vet_complementary(session_id: str):
+    if not run_complementary_treatments_task:
+        raise RuntimeError("Complementary-treatments worker not available. Did you deploy tasks/vet_tasks.py?")
+    task = await run_complementary_treatments_task.kiq(session_id=session_id)
+    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="complementary_treatments")

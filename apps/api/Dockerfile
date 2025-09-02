@@ -14,6 +14,8 @@ RUN apt-get update && \
 # 1) copy shared libs and set PYTHONPATH (build context = repo root)
 COPY libs/common /opt/libs/common
 COPY libs/tasks  /opt/libs/tasks
+COPY libs/vet_tasks /opt/libs/vet_tasks
+
 ENV PYTHONPATH="/opt/libs:${PYTHONPATH}"
 
 # 2) app deps

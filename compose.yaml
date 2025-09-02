@@ -16,8 +16,10 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      VET_REDIS_URL: redis://redis:6379/0
       STREAM_REDIS_HOST: redis
       STREAM_REDIS_PORT: "6379"
+      STREAM_REDIS_SSL: "false"
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
     volumes:
       - ./service_account.json:/secrets/service_account.json:ro
@@ -36,13 +38,40 @@ services:
       REDIS_URL: redis://redis:6379/0
       STREAM_REDIS_HOST: redis
       STREAM_REDIS_PORT: "6379"
+      STREAM_REDIS_SSL: "false"
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
     volumes:
       - ./service_account.json:/secrets/service_account.json:ro
     depends_on:
       - redis
     ports:
-      - "8081:8080"   # worker health endpoint
+      - "8081:8080"   # health endpoint
+    restart: unless-stopped
+
+  # NEW: Vet workflow worker (TaskIQ) ----------------------------------
+  vet_worker:
+    build:
+      context: .
+      dockerfile: apps/vet_worker/Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      VET_REDIS_URL: redis://redis:6379/0
+      VET_STREAM: taskiq:vet
+      STREAM_REDIS_HOST: redis
+      STREAM_REDIS_PORT: "6379"
+      STREAM_REDIS_SSL: "false"
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
+      # Optional: inject your dummy session inputs here (JSON map of session_id -> object)
+      # VET_DUMMY_SESSIONS_JSON: |
+      #   {"sess-gi": {"patient":{"species":"canine","breed":"Beagle","age":5,"sex":"F","weight_kg":11.4},
+      #                "complaints":["Vomiting","Diarrhea"], "vitals":{"temp_c":39.7}}}
+    volumes:
+      - ./service_account.json:/secrets/service_account.json:ro
+    depends_on:
+      - redis
+    ports:
+      - "8082:8080"   # health endpoint
     restart: unless-stopped
 
   relay:
@@ -53,6 +82,7 @@ services:
     environment:
       STREAM_REDIS_HOST: redis
       STREAM_REDIS_PORT: "6379"
+      STREAM_REDIS_SSL: "false"
     depends_on:
       - redis
     ports:
