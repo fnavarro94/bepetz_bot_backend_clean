@@ -140,6 +140,79 @@ def _dummy_session_by_id(session_id: str) -> dict:
         "labs": {},
     }
 
+
+def _build_dummy_medications(session: dict) -> list[dict]:
+    """Return a static list of medications with the fields your UI expects."""
+    return [
+        {
+            "name": "Maropitant",
+            "active_principle": "Maropitant citrate",
+            "dose": 1.0,                 # numeric dose
+            "dose_unit": "mg/kg",        # unit shown next to 'Dosis'
+            "presentation": "Solución inyectable 10 mg/ml",
+            "frequency": "cada 24 h",
+            "quantity": 3,               # number of days/packs/etc.
+            "quantity_unit": "días",
+            "notes": "Antiemético. Administrar con alimento para reducir náuseas."
+        },
+        {
+            "name": "Metronidazol",
+            "active_principle": "Metronidazol",
+            "dose": 10.0,
+            "dose_unit": "mg/kg",
+            "presentation": "Tabletas 250 mg",
+            "frequency": "cada 12 h",
+            "quantity": 5,
+            "quantity_unit": "días",
+            "notes": "Si hay diarrea persistente. Suspender si aparece ataxia."
+        },
+        {
+            "name": "Omeprazol",
+            "active_principle": "Omeprazol",
+            "dose": 1.0,
+            "dose_unit": "mg/kg",
+            "presentation": "Cápsulas 10 mg",
+            "frequency": "cada 24 h",
+            "quantity": 7,
+            "quantity_unit": "días",
+            "notes": "Proteger mucosa gástrica; dar por la mañana en ayunas."
+        },
+    ]
+
+
+def _build_dummy_complementaries(session: dict) -> list[dict]:
+    """Return a static list of complementary treatments."""
+    return [
+        {
+            "name": "Fluidoterapia",
+            "quantity": "20–40 ml/kg/día",
+            "notes": "Cristaloides balanceados, ajustar según deshidratación."
+        },
+        {
+            "name": "Dieta blanda",
+            "quantity": "3–5 días",
+            "notes": "Porciones pequeñas y frecuentes; arroz y pollo hervido."
+        },
+        {
+            "name": "Pro/Prebióticos",
+            "quantity": "según rótulo",
+            "notes": "Iniciar tras 24–48 h de mejoría digestiva."
+        },
+    ]
+
+
+def _build_dummy_differentials(session: dict) -> list[dict]:
+    """Return ONLY the list of differentials the UI needs."""
+    rationale = (
+        "Porque presenta vómitos y diarrea postprandiales, poco apetito, "
+        "decaimiento, leve deshidratación y sensibilidad abdominal."
+    )
+    return [
+        {"name": "Gastroenteritis aguda",   "probability": 0.67, "rationale": rationale},
+        {"name": "Pancreatitis aguda",     "probability": 0.35, "rationale": rationale},
+        {"name": "Indiscreción alimentaria","probability": 0.24, "rationale": rationale},
+    ]
+
 async def _fetch_vet_session(session_id: str) -> dict:
     """
     Dummy fetch: returns generated/ENV-provided JSON.
@@ -223,20 +296,37 @@ def _draft_diagnostics_from_session(session: dict) -> dict:
 # ------------------------------------------------------------------------------
 # Taskiq tasks (queueable from API)
 # ------------------------------------------------------------------------------
-
 @vet_broker.task
 async def run_diagnostics_task(session_id: str) -> None:
-    print(f"running diagnostics task")
+    """Queueable task: emit a minimal list of differentials + persist it."""
+    print("running diagnostics task")
     await _publish_status(session_id, "status", phase="diagnostics_started")
     try:
+        # (Optional) fetch dummy session data – not used for the static payload,
+        # but keep it here in case you want to branch later.
         session = await _fetch_vet_session(session_id)
         if not session:
             await _publish_status(session_id, "error", message="No dummy data available for session")
             logger.warning("No dummy session data: %s", session_id)
             return
 
-        result = _draft_diagnostics_from_session(session)
-        await _persist_output(session_id, "diagnostics", result)
+        # Build ONLY what the UI needs: a list of {name, probability, rationale}
+        rationale = (
+            "Porque presenta vómitos y diarrea postprandiales, poco apetito, "
+            "decaimiento, leve deshidratación y sensibilidad abdominal."
+        )
+        items = [
+            {"name": "Gastroenteritis aguda",     "probability": 0.67, "rationale": rationale},
+            {"name": "Pancreatitis aguda",       "probability": 0.35, "rationale": rationale},
+            {"name": "Indiscreción alimentaria", "probability": 0.24, "rationale": rationale},
+        ]
+        payload = {"items": items}
+
+        # Stream to relay as a named SSE event: event='diagnostics', data=payload
+        await _publish_status(session_id, "diagnostics", **payload)
+
+        # Persist the same JSON so the UI can fetch it later if desired
+        await _persist_output(session_id, "diagnostics", payload)
 
         await _publish_status(session_id, "status", phase="diagnostics_finished")
         await _publish_status(session_id, "done", kind="diagnostics")
@@ -245,20 +335,40 @@ async def run_diagnostics_task(session_id: str) -> None:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Diagnostics failed (session=%s): %s", session_id, e)
 
-
 @vet_broker.task
 async def run_additional_exams_task(session_id: str) -> None:
+    """Queueable task: emit a minimal list of complementary exams + persist it."""
     await _publish_status(session_id, "status", phase="additional_exams_started")
     try:
+        # Keep fetch in case you want to branch by session later
         session = await _fetch_vet_session(session_id)
-        # TODO: implement real logic
-        result = {
-            "message": "Additional exams generator not implemented yet.",
-            "inputs_preview": {"complaints": session.get("complaints", []), "vitals": session.get("vitals", {})},
-        }
-        await _persist_output(session_id, "additional_exams", result)
+        if not session:
+            await _publish_status(session_id, "error", message="No dummy data available for session")
+            logger.warning("No dummy session data: %s", session_id)
+            return
+
+        # Build ONLY what the UI needs for the form
+        items = [
+            {
+                "name": "Urianálisis",
+                "indications": "Examen físico, químico y microscópico de orina.",
+            },
+            {
+                "name": "Radiografía abdominal",
+                "indications": "Proyecciones latero-lateral y ventro-dorsal.",
+            },
+        ]
+        payload = {"items": items}
+
+        # Stream to relay as a named SSE event
+        await _publish_status(session_id, "additional_exams", **payload)
+
+        # Persist the same JSON for later fetch
+        await _persist_output(session_id, "additional_exams", payload)
+
         await _publish_status(session_id, "status", phase="additional_exams_finished")
         await _publish_status(session_id, "done", kind="additional_exams")
+        logger.info("Additional exams completed (session=%s)", session_id)
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Additional exams failed (session=%s): %s", session_id, e)
@@ -266,14 +376,27 @@ async def run_additional_exams_task(session_id: str) -> None:
 
 @vet_broker.task
 async def run_prescription_task(session_id: str) -> None:
+    """Queueable task: emit medications list for the 'Plan terapéutico / Medicación' UI."""
     await _publish_status(session_id, "status", phase="prescription_started")
     try:
         session = await _fetch_vet_session(session_id)
-        # TODO: implement real logic
-        result = {"message": "Prescription generator not implemented yet.", "patient": session.get("patient")}
-        await _persist_output(session_id, "prescription", result)
+        if not session:
+            await _publish_status(session_id, "error", message="No dummy data available for session")
+            logger.warning("No dummy session data: %s", session_id)
+            return
+
+        items = _build_dummy_medications(session)
+        payload = {"items": items}
+
+        # Stream to SSE relay with the named event this panel listens to
+        await _publish_status(session_id, "prescription", **payload)
+
+        # Persist
+        await _persist_output(session_id, "prescription", payload)
+
         await _publish_status(session_id, "status", phase="prescription_finished")
         await _publish_status(session_id, "done", kind="prescription")
+        logger.info("Prescription completed (session=%s)", session_id)
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Prescription failed (session=%s): %s", session_id, e)
@@ -281,14 +404,27 @@ async def run_prescription_task(session_id: str) -> None:
 
 @vet_broker.task
 async def run_complementary_treatments_task(session_id: str) -> None:
+    """Queueable task: emit complementary treatments list for the UI."""
     await _publish_status(session_id, "status", phase="complementary_started")
     try:
         session = await _fetch_vet_session(session_id)
-        # TODO: implement real logic
-        result = {"message": "Complementary treatments generator not implemented yet.", "history": session.get("history")}
-        await _persist_output(session_id, "complementary_treatments", result)
+        if not session:
+            await _publish_status(session_id, "error", message="No dummy data available for session")
+            logger.warning("No dummy session data: %s", session_id)
+            return
+
+        items = _build_dummy_complementaries(session)
+        payload = {"items": items}
+
+        # Named event must be 'complementary_treatments'
+        await _publish_status(session_id, "complementary_treatments", **payload)
+
+        # Persist
+        await _persist_output(session_id, "complementary_treatments", payload)
+
         await _publish_status(session_id, "status", phase="complementary_finished")
         await _publish_status(session_id, "done", kind="complementary_treatments")
+        logger.info("Complementary treatments completed (session=%s)", session_id)
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Complementary treatments failed (session=%s): %s", session_id, e)
