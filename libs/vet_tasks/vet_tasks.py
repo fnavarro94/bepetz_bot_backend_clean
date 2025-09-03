@@ -300,7 +300,7 @@ def _draft_diagnostics_from_session(session: dict) -> dict:
 async def run_diagnostics_task(session_id: str) -> None:
     """Queueable task: emit a minimal list of differentials + persist it."""
     print("running diagnostics task")
-    await _publish_status(session_id, "status", phase="diagnostics_started")
+    await _publish_status(session_id, "status", phase="diagnostics-started")
     try:
         # (Optional) fetch dummy session data – not used for the static payload,
         # but keep it here in case you want to branch later.
@@ -328,7 +328,7 @@ async def run_diagnostics_task(session_id: str) -> None:
         # Persist the same JSON so the UI can fetch it later if desired
         await _persist_output(session_id, "diagnostics", payload)
 
-        await _publish_status(session_id, "status", phase="diagnostics_finished")
+        await _publish_status(session_id, "status", phase="diagnostics-finished")
         await _publish_status(session_id, "done", kind="diagnostics")
         logger.info("Diagnostics completed (session=%s)", session_id)
     except Exception as e:
@@ -338,7 +338,7 @@ async def run_diagnostics_task(session_id: str) -> None:
 @vet_broker.task
 async def run_additional_exams_task(session_id: str) -> None:
     """Queueable task: emit a minimal list of complementary exams + persist it."""
-    await _publish_status(session_id, "status", phase="additional_exams_started")
+    await _publish_status(session_id, "status", phase="additional-exams-started")
     try:
         # Keep fetch in case you want to branch by session later
         session = await _fetch_vet_session(session_id)
@@ -361,13 +361,13 @@ async def run_additional_exams_task(session_id: str) -> None:
         payload = {"items": items}
 
         # Stream to relay as a named SSE event
-        await _publish_status(session_id, "additional_exams", **payload)
+        await _publish_status(session_id, "additional-exams", **payload)
 
         # Persist the same JSON for later fetch
         await _persist_output(session_id, "additional_exams", payload)
 
-        await _publish_status(session_id, "status", phase="additional_exams_finished")
-        await _publish_status(session_id, "done", kind="additional_exams")
+        await _publish_status(session_id, "status", phase="additional-exams-finished")
+        await _publish_status(session_id, "done", kind="additional-exams")
         logger.info("Additional exams completed (session=%s)", session_id)
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
@@ -377,7 +377,7 @@ async def run_additional_exams_task(session_id: str) -> None:
 @vet_broker.task
 async def run_prescription_task(session_id: str) -> None:
     """Queueable task: emit medications list for the 'Plan terapéutico / Medicación' UI."""
-    await _publish_status(session_id, "status", phase="prescription_started")
+    await _publish_status(session_id, "status", phase="prescription-started")
     try:
         session = await _fetch_vet_session(session_id)
         if not session:
@@ -394,7 +394,7 @@ async def run_prescription_task(session_id: str) -> None:
         # Persist
         await _persist_output(session_id, "prescription", payload)
 
-        await _publish_status(session_id, "status", phase="prescription_finished")
+        await _publish_status(session_id, "status", phase="prescription-finished")
         await _publish_status(session_id, "done", kind="prescription")
         logger.info("Prescription completed (session=%s)", session_id)
     except Exception as e:
@@ -405,7 +405,7 @@ async def run_prescription_task(session_id: str) -> None:
 @vet_broker.task
 async def run_complementary_treatments_task(session_id: str) -> None:
     """Queueable task: emit complementary treatments list for the UI."""
-    await _publish_status(session_id, "status", phase="complementary_started")
+    await _publish_status(session_id, "status", phase="complementary-treatments-started")
     try:
         session = await _fetch_vet_session(session_id)
         if not session:
@@ -417,13 +417,13 @@ async def run_complementary_treatments_task(session_id: str) -> None:
         payload = {"items": items}
 
         # Named event must be 'complementary_treatments'
-        await _publish_status(session_id, "complementary_treatments", **payload)
+        await _publish_status(session_id, "complementary-treatments", **payload)
 
         # Persist
         await _persist_output(session_id, "complementary_treatments", payload)
 
-        await _publish_status(session_id, "status", phase="complementary_finished")
-        await _publish_status(session_id, "done", kind="complementary_treatments")
+        await _publish_status(session_id, "status", phase="complementary-treatments-finished")
+        await _publish_status(session_id, "done", kind="complementary-treatments")
         logger.info("Complementary treatments completed (session=%s)", session_id)
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
