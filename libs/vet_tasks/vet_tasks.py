@@ -20,6 +20,11 @@ import redis.asyncio as aioredis
 from google.cloud import firestore
 
 from common.broker import vet_broker
+from common.llm_vet import (
+    gen_diagnostics_from_llm,
+    gen_additional_exams_from_llm,
+    gen_prescription_from_llm,
+    gen_complementary_treatments_from_llm,)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("vet-worker")
@@ -310,17 +315,14 @@ async def run_diagnostics_task(session_id: str) -> None:
             logger.warning("No dummy session data: %s", session_id)
             return
 
-        # Build ONLY what the UI needs: a list of {name, probability, rationale}
-        rationale = (
-            "Porque presenta vómitos y diarrea postprandiales, poco apetito, "
-            "decaimiento, leve deshidratación y sensibilidad abdominal."
-        )
-        items = [
-            {"name": "Gastroenteritis aguda",     "probability": 0.67, "rationale": rationale},
-            {"name": "Pancreatitis aguda",       "probability": 0.35, "rationale": rationale},
-            {"name": "Indiscreción alimentaria", "probability": 0.24, "rationale": rationale},
-        ]
-        payload = {"items": items}
+         # Generate via LLM (Structured Outputs); fallback to old static list on failure.
+        try:
+            payload = await gen_diagnostics_from_llm(session)
+            print(f"the payload was {payload}")
+        except Exception as e:
+            logger.warning("LLM diagnostics failed; falling back to stub. reason=%s", e)
+            items = _build_dummy_differentials(session)
+            payload = {"items": items}
 
         # Stream to relay as a named SSE event: event='diagnostics', data=payload
         await _publish_status(session_id, "diagnostics", **payload)
@@ -348,17 +350,16 @@ async def run_additional_exams_task(session_id: str) -> None:
             return
 
         # Build ONLY what the UI needs for the form
-        items = [
-            {
-                "name": "Urianálisis",
-                "indications": "Examen físico, químico y microscópico de orina.",
-            },
-            {
-                "name": "Radiografía abdominal",
-                "indications": "Proyecciones latero-lateral y ventro-dorsal.",
-            },
-        ]
-        payload = {"items": items}
+        try:
+            payload = await gen_additional_exams_from_llm(session)
+        except Exception as e:
+            logger.warning("LLM additional_exams failed; falling back to stub. reason=%s", e)
+            payload = {
+                "items": [
+                    {"name": "Urianálisis", "indications": "Examen físico, químico y microscópico de orina."},
+                    {"name": "Radiografía abdominal", "indications": "Proyecciones latero-lateral y ventro-dorsal."},
+                ]
+            }
 
         # Stream to relay as a named SSE event
         await _publish_status(session_id, "additional-exams", **payload)
@@ -385,8 +386,11 @@ async def run_prescription_task(session_id: str) -> None:
             logger.warning("No dummy session data: %s", session_id)
             return
 
-        items = _build_dummy_medications(session)
-        payload = {"items": items}
+        try:
+           payload = await gen_prescription_from_llm(session)
+        except Exception as e:
+            logger.warning("LLM prescription failed; falling back to stub. reason=%s", e)
+            payload = {"items": _build_dummy_medications(session)}
 
         # Stream to SSE relay with the named event this panel listens to
         await _publish_status(session_id, "prescription", **payload)
@@ -413,8 +417,11 @@ async def run_complementary_treatments_task(session_id: str) -> None:
             logger.warning("No dummy session data: %s", session_id)
             return
 
-        items = _build_dummy_complementaries(session)
-        payload = {"items": items}
+        try:
+            payload = await gen_complementary_treatments_from_llm(session)
+        except Exception as e:
+            logger.warning("LLM complementary_treatments failed; falling back to stub. reason=%s", e)
+            payload = {"items": _build_dummy_complementaries(session)}
 
         # Named event must be 'complementary_treatments'
         await _publish_status(session_id, "complementary-treatments", **payload)

@@ -20,3 +20,4 @@ SQLAlchemy==2.0.41              # imported via common.db_conn
 
 # ── Local‑dev helpers ───────────────────────────────────────────
 python-dotenv==1.1.1
+openai==1.105.0
