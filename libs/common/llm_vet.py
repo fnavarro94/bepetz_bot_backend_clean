@@ -10,13 +10,12 @@ logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL = os.getenv("VET_LLM_MODEL", "gpt-5-mini")
 
-# GPT-5-only knobs (optional). See: reasoning_effort + verbosity
-# https://openai.com/index/introducing-gpt-5-for-developers/
-REASONING_EFFORT = os.getenv("VET_LLM_REASONING_EFFORT", "minimal")  # minimal | low | medium | high
-VERBOSITY = os.getenv("VET_LLM_VERBOSITY", "low")                    # low | medium | high
+# GPT-5-only knobs (optional)
+REASONING_EFFORT = os.getenv("VET_LLM_REASONING_EFFORT", "minimal")  # minimal|low|medium|high
+VERBOSITY = os.getenv("VET_LLM_VERBOSITY", "low")                    # low|medium|high
 MAX_COMPLETION_TOKENS = int(os.getenv("VET_LLM_MAX_COMPLETION_TOKENS", "0") or 0)
 
-# Non-GPT-5 knobs (optional; ignored by GPT-5)
+# Non–GPT-5 knobs (ignored by GPT-5)
 TEMP = os.getenv("VET_LLM_TEMPERATURE")
 TOP_P = os.getenv("VET_LLM_TOP_P")
 
@@ -26,17 +25,34 @@ _client = None
 _openai_import_err: Optional[BaseException] = None
 
 def _ensure_openai_import():
+    """Import SDK and exception types on demand."""
     global _AsyncOpenAI, _openai_import_err
     if _AsyncOpenAI is not None:
         return
     try:
         from openai import AsyncOpenAI  # pip install openai>=1.72.0
+        # import exceptions for granular handling
+        # Note: Some environments may not have all of these—fallbacks below.
+        from openai import (  # type: ignore
+            APIConnectionError, APITimeoutError, RateLimitError,
+            AuthenticationError, BadRequestError, APIError
+        )
+        # expose to module namespace for type checking/except blocks
+        globals().update({
+            "APIConnectionError": APIConnectionError,
+            "APITimeoutError": APITimeoutError,
+            "RateLimitError": RateLimitError,
+            "AuthenticationError": AuthenticationError,
+            "BadRequestError": BadRequestError,
+            "APIError": APIError,
+        })
         _AsyncOpenAI = AsyncOpenAI
     except Exception as e:
         _openai_import_err = e
         _AsyncOpenAI = None
 
 def _get_client():
+    """Build a reusable AsyncOpenAI client with timeouts and retries."""
     global _client
     _ensure_openai_import()
     if _AsyncOpenAI is None:
@@ -51,6 +67,8 @@ def _get_client():
     _client = _AsyncOpenAI(
         api_key=api_key,
         base_url=os.getenv("OPENAI_BASE_URL") or None,
+        timeout=60.0,     # total request timeout (seconds)
+        max_retries=5,    # SDK-level retries with exponential backoff
     )
     return _client
 
@@ -89,6 +107,7 @@ ADDITIONAL_EXAMS_SCHEMA = {
                 "properties": {
                     "name": {"type": "string"},
                     "indications": {"type": "string"},
+                    # New required field:
                     "priority": {"type": "string", "enum": ["alta", "media", "baja"]},
                 },
                 "required": ["name", "indications", "priority"],
@@ -161,8 +180,10 @@ async def _structured_call(
 ) -> Dict[str, Any]:
     """
     Calls the model with a strict JSON Schema and returns parsed dict.
+
     - GPT-5: omit temperature/top_p; use reasoning_effort & verbosity (+ optional max_completion_tokens)
     - Non-GPT-5: allow temperature/top_p if provided
+    - Raises RuntimeError with a human-readable cause on network/auth/HTTP issues
     """
     client = _get_client()
 
@@ -171,7 +192,6 @@ async def _structured_call(
         {"role": "user", "content": json.dumps(user_context, ensure_ascii=False)},
     ]
 
-    # Build parameters per model family
     kwargs: Dict[str, Any] = {
         "model": MODEL,
         "messages": messages,
@@ -186,26 +206,47 @@ async def _structured_call(
     }
 
     if _is_gpt5(MODEL):
-        # GPT-5 rejects temperature/top_p; use these knobs instead.
+        # GPT-5: do not send temperature/top_p
         if REASONING_EFFORT:
             kwargs["reasoning_effort"] = REASONING_EFFORT
         if VERBOSITY:
             kwargs["verbosity"] = VERBOSITY
         if MAX_COMPLETION_TOKENS > 0:
-            # Chat Completions uses max_completion_tokens for reasoning models.
-            # (Responses API uses max_output_tokens.)
-            kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS  # :contentReference[oaicite:2]{index=2}
+            kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
     else:
-        # Non-GPT-5 models: allow standard sampling params.
+        # Non-GPT-5 models: standard sampling controls
         if temperature is not None:
             kwargs["temperature"] = float(temperature)
         if TOP_P:
             kwargs["top_p"] = float(TOP_P)
 
-    resp = await client.chat.completions.create(**kwargs)
+    try:
+        resp = await client.chat.completions.create(**kwargs)
+    except NameError:
+        # In case exception classes weren't imported for some reason:
+        raise RuntimeError("OpenAI SDK is unavailable in this runtime")
+    except AuthenticationError as e:  # 401/invalid key
+        raise RuntimeError(
+            "Authentication error with OpenAI: invalid or missing OPENAI_API_KEY. "
+            "Verify the key is set in the vet-worker service environment."
+        ) from e
+    except (APITimeoutError, APIConnectionError) as e:
+        # Network/DNS/connect/read timeout
+        raise RuntimeError(f"Network/timeout while calling OpenAI: {e.__class__.__name__}: {e}") from e
+    except RateLimitError as e:
+        raise RuntimeError(f"OpenAI rate limit exceeded: {e}") from e
+    except BadRequestError as e:
+        # 400 with helpful message (e.g., bad param)
+        raise RuntimeError(f"Bad request to OpenAI: {e}") from e
+    except APIError as e:
+        # Generic non-2xx API error
+        raise RuntimeError(f"OpenAI API error: {e}") from e
+    except Exception as e:
+        # Catch-all
+        raise RuntimeError(f"Unexpected error calling OpenAI: {e}") from e
 
     msg = resp.choices[0].message
-    # Some newer models include `refusal`; if present, treat as error.
+    # Some reasoning models may set `refusal` if content is refused
     refusal = getattr(msg, "refusal", None)
     if refusal:
         raise RuntimeError(f"Model refusal for {section_name}: {refusal}")
@@ -244,17 +285,17 @@ Cada `item` **debe** incluir:
 - `name`: nombre del examen (p. ej., "Urianálisis").
 - `indications`: breve justificación o protocolo.
 - `priority`: **una** etiqueta de triage ∈ { "alta", "media", "baja" }:
-    - "alta": si el examen cambia conductas inmediatas o descarta urgencias (p. ej., obstrucción, sepsis, cuerpo extraño).
-    - "media": útil para orientar diagnóstico en el mismo día, pero no crítico inmediato.
+    - "alta": cambia conductas inmediatas o descarta urgencias (obstrucción, sepsis, cuerpo extraño).
+    - "media": orienta diagnóstico en el mismo día, pero no crítico inmediato.
     - "baja": diferible o de seguimiento si la evolución es favorable.
 No agregues campos fuera del esquema.
 """
     user_context = {
         "task": "additional_exams",
         "session_snapshot": session,
-         "constraints": [
-           "Máx. 3–5 ítems; prioriza utilidad diagnóstica inicial y costo.",
-           "Asigna `priority` de forma consistente con la presentación clínica."
+        "constraints": [
+            "Máx. 3–5 ítems; prioriza utilidad diagnóstica inicial y costo.",
+            "Asigna `priority` de forma consistente con la presentación clínica."
         ],
     }
     return await _structured_call("additional_exams", ADDITIONAL_EXAMS_SCHEMA, system_prompt, user_context)
