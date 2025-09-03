@@ -1,9 +1,11 @@
 # ==============================================================================
-# File: relay_redis.py  –  SSE + Redis Pub/Sub (user_id & conversation_id in path)
-# Purpose:  ▸ When the first browser connects for a conversation, SUBSCRIBE to
-#             that Redis channel (`<conversation_id>`)
-#           ▸ Fan-out each message to all connected SSE clients for that convo
-#           ▸ When the last client disconnects, UNSUBSCRIBE + cancel task
+# File: relay_redis.py  –  SSE + Redis Pub/Sub with instant open + ready latch
+# Purpose:
+#   ▸ Flush a first SSE frame immediately so the browser fires `onopen` fast
+#   ▸ Keep connections warm with periodic pings
+#   ▸ Maintain a per-channel "ready" flag in Redis while at least one client
+#     is attached, so the API can wait briefly before publishing to avoid
+#     lost-first-message races
 # ==============================================================================
 
 import os
@@ -11,7 +13,7 @@ import json
 import logging
 import asyncio
 import janus
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +29,13 @@ PORT = int(os.getenv("PORT", 8001))
 STREAM_REDIS_HOST = os.getenv("STREAM_REDIS_HOST", "localhost")
 STREAM_REDIS_PORT = int(os.getenv("STREAM_REDIS_PORT", "6379"))
 STREAM_REDIS_SSL  = os.getenv("STREAM_REDIS_SSL", "false").lower() == "true"
+
+# How long the "ready" key should live (refreshed periodically)
+READY_TTL_SECONDS = int(os.getenv("READY_TTL_SECONDS", "15"))
+# How often to refresh the ready TTL while at least one client is connected
+READY_REFRESH_SECONDS = int(os.getenv("READY_REFRESH_SECONDS", "5"))
+# Ping interval for SSE keepalive (comment frames)
+SSE_PING_MS = int(os.getenv("SSE_PING_MS", "15000"))
 
 # ── LOGGING ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -70,20 +79,72 @@ async def _startup():
         log.error("Redis PING FAILED: %s", e, exc_info=True)
 
 # ── REGISTRIES ─────────────────────────────────────────────────────────
-# conversation_id ➜ list of (janus.Queue, owning_event_loop)
+# channel_name ➜ list of (janus.Queue, owning_event_loop)
 CLIENTS: Dict[str, List[Tuple[janus.Queue, asyncio.AbstractEventLoop]]] = {}
-# conversation_id ➜ background Redis listener task
+# channel_name ➜ background Redis listener task (Pub/Sub)
 SUB_TASKS: Dict[str, asyncio.Task] = {}
+# channel_name ➜ background task that refreshes the "ready" TTL
+READY_TASKS: Dict[str, asyncio.Task] = {}
 
+# ── READY LATCH HELPERS ────────────────────────────────────────────────
+def _ready_key(channel_name: str) -> str:
+    # Channel names already include prefixes like "vet:<session_id>"
+    return f"sse:ready:{channel_name}"
 
+async def _set_ready(channel_name: str):
+    try:
+        await redis_stream.setex(_ready_key(channel_name), READY_TTL_SECONDS, "1")
+    except Exception as e:
+        log.warning("Failed to set ready key for %s: %s", channel_name, e)
+
+async def _clear_ready(channel_name: str):
+    try:
+        await redis_stream.delete(_ready_key(channel_name))
+    except Exception:
+        pass
+
+def _ensure_ready_refresher(channel_name: str):
+    """Start/ensure a single refresher task per channel that keeps the ready key alive."""
+    if channel_name in READY_TASKS:
+        return
+
+    async def refresher():
+        try:
+            # Initial mark as ready quickly
+            await _set_ready(channel_name)
+            while True:
+                await asyncio.sleep(READY_REFRESH_SECONDS)
+                # If no clients remain, stop refreshing
+                if not CLIENTS.get(channel_name):
+                    break
+                await _set_ready(channel_name)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # If we exit, clear the key explicitly (or let TTL expire)
+            await _clear_ready(channel_name)
+            READY_TASKS.pop(channel_name, None)
+            log.info("⏹ ready-refresher stopped for %s", channel_name)
+
+    READY_TASKS[channel_name] = asyncio.create_task(refresher())
+    log.info("▶ ready-refresher started for %s", channel_name)
+
+# ── CORE SSE HANDLER ───────────────────────────────────────────────────
 async def _sse_for_channel(channel_name: str, attach_label: str = ""):
     """
     Generic SSE streamer for any Redis Pub/Sub channel.
-    Manages: client registry, lazy subscribe, fanout, and cleanup.
+    - Registers client
+    - Lazily starts a single Redis SUBSCRIBE loop per channel
+    - Starts a single "ready" refresher per channel
+    - Flushes an initial frame immediately so EventSource.onopen fires fast
+    - Fans out messages to all attached clients
     """
     q    = janus.Queue()
     loop = asyncio.get_running_loop()
     CLIENTS.setdefault(channel_name, []).append((q, loop))
+
+    # Start/reset the "ready" refresher (keeps the ready key alive)
+    _ensure_ready_refresher(channel_name)
 
     # Start one background Redis listener per channel
     if channel_name not in SUB_TASKS:
@@ -96,6 +157,7 @@ async def _sse_for_channel(channel_name: str, attach_label: str = ""):
                     if msg.get("type") != "message":
                         continue
                     data = msg.get("data")
+                    # snapshot list to avoid mutation during iteration
                     for queue, _lp in list(CLIENTS.get(channel_name, [])):
                         try:
                             queue.async_q.put_nowait(data)
@@ -115,17 +177,23 @@ async def _sse_for_channel(channel_name: str, attach_label: str = ""):
     log.info("👋 attach  %s channel=%s", attach_label or "client", channel_name)
 
     async def event_gen():
+        # --- FLUSH ASAP: yield a first tiny frame so the client "opens" instantly.
+        # Also set a quick retry for clients.
+        yield {"event": "ready", "data": "{}", "retry": 1000}
+        # Maintain the ready TTL immediately (in case refresher hasn't ticked yet)
+        await _set_ready(channel_name)
+
         try:
             while True:
-                raw = await q.async_q.get()
+                raw = await q.async_q.get()  # str (decode_responses=True)
 
-                # map sentinel used by chat flow (safe to keep)
+                # Map sentinel used by chat flow
                 if isinstance(raw, str) and raw.strip() == "[END-OF-STREAM]":
                     yield {"event": "done", "data": "{}"}
                     yield {"data": raw}
                     continue
 
-                # forward structured control envelopes as named SSE events
+                # Interpret control envelopes as named SSE events
                 obj = None
                 if isinstance(raw, str) and raw and raw[0] in "{[":
                     try:
@@ -143,132 +211,52 @@ async def _sse_for_channel(channel_name: str, attach_label: str = ""):
                     yield {"event": evt, "data": payload_str}
                     continue
 
-                # otherwise stream as plain chunk
+                # Otherwise stream as plain chunk
                 yield {"data": raw}
         finally:
+            # Browser closed SSE connection – cleanup
             clients = CLIENTS.get(channel_name, [])
             try:
                 clients.remove((q, loop))
             except ValueError:
                 pass
+
             if not clients:
                 CLIENTS.pop(channel_name, None)
+                # Stop Redis listener if this was the last client
                 task = SUB_TASKS.pop(channel_name, None)
                 if task:
                     task.cancel()
+                # Stop ready refresher if any
+                rtask = READY_TASKS.pop(channel_name, None)
+                if rtask:
+                    rtask.cancel()
+                # Also clear the ready key now
+                await _clear_ready(channel_name)
+
             await q.aclose()
             log.info("👋 detach %s channel=%s", attach_label or "client", channel_name)
 
     return EventSourceResponse(
         event_gen(),
-        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+        # Starlette will set Content-Type to text/event-stream; we add useful headers.
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",      # helps prevent proxy buffering
+            "Connection": "keep-alive",
+        },
+        ping=SSE_PING_MS,  # keepalive comment every N ms
     )
 
-
-# ── SSE ENDPOINT ───────────────────────────────────────────────────────
+# ── SSE ENDPOINTS ──────────────────────────────────────────────────────
 @app.get("/stream/{user_id}/{conversation_id}")
 async def stream(user_id: str, conversation_id: str):
     """
-    For each connection:
-      • Create a janus.Queue and register it under the conversation.
-      • Lazily start the Redis SUBSCRIBE loop once per conversation.
-      • Yield SSE events from the queue until the client disconnects.
+    Multiparty generic stream keyed by conversation id.
     """
-    q    = janus.Queue()
-    loop = asyncio.get_running_loop()
-    CLIENTS.setdefault(conversation_id, []).append((q, loop))
+    channel = conversation_id
+    return await _sse_for_channel(channel, attach_label=f"conv {conversation_id} user {user_id}")
 
-    # ── LAZY SUBSCRIBE – start once per conversation ───────────────────
-    if conversation_id not in SUB_TASKS:
-        async def fanout():
-            pubsub = redis_stream.pubsub()
-            await pubsub.subscribe(conversation_id)
-            log.info("🔗 SUBSCRIBE %s  (task started)", conversation_id)
-            try:
-                async for msg in pubsub.listen():
-                    if msg.get("type") != "message":
-                        continue
-                    data = msg.get("data")
-                    # snapshot list to avoid mutation during iteration
-                    for queue, _lp in list(CLIENTS.get(conversation_id, [])):
-                        try:
-                            queue.async_q.put_nowait(data)
-                        except Exception:
-                            # if queue is closed, ignore
-                            pass
-            except asyncio.CancelledError:
-                pass
-            finally:
-                try:
-                    await pubsub.unsubscribe(conversation_id)
-                    await pubsub.close()
-                finally:
-                    log.info("⏏︎ UNSUB %s", conversation_id)
-
-        SUB_TASKS[conversation_id] = asyncio.create_task(fanout())
-
-    log.info("👋 attach  conv=%s user=%s", conversation_id, user_id)
-
-    async def event_gen():
-        try:
-            while True:
-                raw = await q.async_q.get()  # str (decode_responses=True)
-
-                # 1) Map sentinel to a named 'done' event (and also keep raw for back-compat)
-                if isinstance(raw, str) and raw.strip() == "[END-OF-STREAM]":
-                    yield {"event": "done", "data": "{}"}
-                    yield {"data": raw}
-                    continue
-
-                # 2) Interpret control envelopes as named SSE events:
-                #    {"event": "status", "data": {...}}
-                obj = None
-                if isinstance(raw, str) and raw and raw[0] in "{[":
-                    try:
-                        obj = json.loads(raw)
-                    except Exception:
-                        obj = None
-
-                if isinstance(obj, dict) and "event" in obj:
-                    evt = str(obj["event"])
-                    payload = obj.get("data", {})
-                    try:
-                        payload_str = json.dumps(payload)
-                    except Exception:
-                        payload_str = "{}"
-                    yield {"event": evt, "data": payload_str}
-                    continue
-
-                # 3) Fallback: treat as a normal token chunk
-                yield {"data": raw}
-
-        finally:
-            # Browser closed SSE connection
-            # Remove this client's queue
-            clients = CLIENTS.get(conversation_id, [])
-            try:
-                clients.remove((q, loop))
-            except ValueError:
-                pass
-            if not clients:
-                CLIENTS.pop(conversation_id, None)
-                # If nobody else is listening → stop Redis task
-                task = SUB_TASKS.pop(conversation_id, None)
-                if task:
-                    task.cancel()
-            await q.aclose()
-            log.info("👋 detach  conv=%s user=%s", conversation_id, user_id)
-
-    return EventSourceResponse(
-        event_gen(),
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # helps prevent proxy buffering
-        },
-    )
-
-
-# ── VET WORKFLOW SSE ENDPOINTS ─────────────────────────────────────────
 # Worker publishes to:
 #   • vet:{session_id}                         (all vet events)
 #   • vet:{session_id}:{kind}                  (optional per-workflow channel)
@@ -282,7 +270,6 @@ async def vet_stream(session_id: str):
     channel = f"vet:{session_id}"
     return await _sse_for_channel(channel, attach_label=f"vet-session {session_id}")
 
-
 @app.get("/vet-stream/{session_id}/{kind}")
 async def vet_stream_kind(session_id: str, kind: str):
     """
@@ -292,7 +279,24 @@ async def vet_stream_kind(session_id: str, kind: str):
     channel = f"vet:{session_id}:{kind}"
     return await _sse_for_channel(channel, attach_label=f"vet-{kind} {session_id}")
 
+# ── OPTIONAL: READY CHECK ENDPOINTS (useful if API won't touch Redis directly) ──
+@app.get("/ready/vet/{session_id}")
+async def ready_vet(session_id: str):
+    """
+    Returns {"ready": true/false} indicating if any client is attached to vet:{session_id}.
+    """
+    channel = f"vet:{session_id}"
+    val = await redis_stream.get(_ready_key(channel))
+    return {"ready": bool(val)}
 
+@app.get("/ready/conv/{conversation_id}")
+async def ready_conv(conversation_id: str):
+    """
+    Returns {"ready": true/false} indicating if any client is attached to {conversation_id}.
+    """
+    channel = conversation_id
+    val = await redis_stream.get(_ready_key(channel))
+    return {"ready": bool(val)}
 
 # ── RUN ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
