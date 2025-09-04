@@ -2,13 +2,24 @@
 import os
 import json
 import logging
+from typing import Any, Dict, Optional, List
+
+# imports para leer datos de base de datos medica
 from typing import Any, Dict, Optional
+from common.vet_db_context import (
+    build_session_snapshot_from_consultation,
+    fetch_definitive_diagnosis,
+    fetch_prescribed_medications,
+)
+
 
 logger = logging.getLogger("vet-llm")
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL = os.getenv("VET_LLM_MODEL", "gpt-5-mini")
+# NEW: DB config for consultation → session_snapshot
+PG_DSN = os.getenv("PG_DSN")  # e.g., "postgresql://user:pass@localhost:6543/bepetzdb"
 
 # GPT-5-only knobs (optional)
 REASONING_EFFORT = os.getenv("VET_LLM_REASONING_EFFORT", "minimal")  # minimal|low|medium|high
@@ -257,6 +268,10 @@ async def _structured_call(
         logger.exception("Failed to parse JSON for %s: %s", section_name, e)
         raise
 
+
+async def gen_diagnostics_for_consultation(consultation_id: int) -> Dict[str, Any]:
+    session = await build_session_snapshot_from_consultation(consultation_id)
+    return await gen_diagnostics_from_llm(session)
 # ── Section-specific generators (Spanish) ─────────────────────────────────────
 async def gen_diagnostics_from_llm(session: Dict[str, Any]) -> Dict[str, Any]:
     system_prompt = """
@@ -267,6 +282,7 @@ Restricciones:
 - `probability` ∈ [0,1] (no es necesario que sumen 1).
 - `rationale`: 1–2 frases concisas basadas en los signos del contexto.
 - No inventes datos que no estén en el contexto ni agregues campos extra.
+- sino hay datos suficientes pra hacer un diagnostico envia en el mismo formato de la respuesta contenido que indica que no hay diagnostico
 """
     user_context = {
         "task": "differential_diagnoses",
@@ -277,22 +293,49 @@ Restricciones:
     }
     return await _structured_call("diagnostics", DIAGNOSTICS_SCHEMA, system_prompt, user_context)
 
-async def gen_additional_exams_from_llm(session: Dict[str, Any]) -> Dict[str, Any]:
+
+
+async def gen_additional_exams_for_consultation(consultation_id: int | str) -> Dict[str, Any]:
+    session = await build_session_snapshot_from_consultation(consultation_id)
+    definitive = await fetch_definitive_diagnosis(consultation_id)
+    # Always call the LLM; abstention is handled in the prompt as a structured item.
+    return await gen_additional_exams_from_llm(
+        session,
+        definitive_diagnosis=definitive if any((definitive or {}).values()) else None,
+    )
+
+
+async def gen_additional_exams_from_llm(
+    session: Dict[str, Any],
+    *,
+    definitive_diagnosis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     system_prompt = """
 Eres un asistente clínico veterinario. Devuelve **solo** el JSON pedido.
 Objetivo: proponer exámenes complementarios razonables para el caso.
+
 Cada `item` **debe** incluir:
-- `name`: nombre del examen (p. ej., "Urianálisis").
-- `indications`: breve justificación o protocolo.
-- `priority`: **una** etiqueta de triage ∈ { "alta", "media", "baja" }:
-    - "alta": cambia conductas inmediatas o descarta urgencias (obstrucción, sepsis, cuerpo extraño).
-    - "media": orienta diagnóstico en el mismo día, pero no crítico inmediato.
-    - "baja": diferible o de seguimiento si la evolución es favorable.
+- `name` (p. ej., "Urianálisis")
+- `indications` (justificación breve / protocolo)
+- `priority` ∈ { "alta", "media", "baja" }
+
+Usa TODA la información disponible:
+- Contexto clínico (anamnesis, signos, constantes y examen físico).
+- **Diagnóstico definitivo del/la veterinario/a** (si existe).
+
+Reglas:
+- No inventes datos fuera del contexto.
+- Prioriza estudios que cambien conducta hoy o descarten urgencias.
+- **Si el contexto es insuficiente y NO hay diagnóstico definitivo**, devuelve **exactamente un** item con:
+  { "name": "Información insuficiente",
+    "indications": "<explica brevemente qué falta>",
+    "priority": "baja" }
 No agregues campos fuera del esquema.
 """
     user_context = {
         "task": "additional_exams",
         "session_snapshot": session,
+        "previous": {"definitive_diagnosis": definitive_diagnosis} if definitive_diagnosis else {},
         "constraints": [
             "Máx. 3–5 ítems; prioriza utilidad diagnóstica inicial y costo.",
             "Asigna `priority` de forma consistente con la presentación clínica."
@@ -300,32 +343,122 @@ No agregues campos fuera del esquema.
     }
     return await _structured_call("additional_exams", ADDITIONAL_EXAMS_SCHEMA, system_prompt, user_context)
 
-async def gen_prescription_from_llm(session: Dict[str, Any]) -> Dict[str, Any]:
+
+
+
+async def gen_prescription_for_consultation(consultation_id: int | str) -> Dict[str, Any]:
+    session = await build_session_snapshot_from_consultation(consultation_id)
+    definitive = await fetch_definitive_diagnosis(consultation_id)
+    # Siempre invocamos al LLM; si falta contexto y no hay dx definitivo,
+    # el propio modelo devuelve el item de "Información insuficiente".
+    return await gen_prescription_from_llm(
+        session,
+        definitive_diagnosis=definitive if any((definitive or {}).values()) else None,
+    )
+
+
+async def gen_prescription_from_llm(
+    session: Dict[str, Any],
+    *,
+    definitive_diagnosis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     system_prompt = """
 Eres un asistente clínico veterinario. Devuelve **solo** el JSON pedido.
 Objetivo: plan terapéutico / medicación.
-Para cada `item` incluye TODOS los campos del esquema con dosis en mg/kg cuando aplique.
-Notas:
-- Usa fármacos comunes para pequeños animales.
-- Ajusta dosis a rangos habituales y evita contraindicaciones evidentes por el contexto.
-- Español; sin campos extra.
+
+Para cada `item` incluye TODOS los campos del esquema:
+- `name` (p. ej., "Metronidazol")
+- `active_principle`
+- `dose` (número, en mg/kg cuando aplique)
+- `dose_unit` (p. ej., "mg/kg")
+- `presentation` (p. ej., "Tabletas 250 mg")
+- `frequency` (p. ej., "cada 12 h")
+- `quantity` (entero)
+- `quantity_unit` (p. ej., "días")
+- `notes` (indicaciones/precauciones breves)
+
+Usa TODA la información disponible:
+- Contexto clínico (anamnesis, signos, constantes y examen físico).
+- **Diagnóstico definitivo del/la veterinario/a** si está presente.
+
+Reglas:
+- No inventes datos fuera del contexto. Evita contraindicaciones obvias (especie/peso/estado).
+- Ajusta dosis a rangos habituales; si falta un dato crítico (p. ej., peso), evita fármacos que lo requieran.
+- **Si el contexto es insuficiente y NO hay diagnóstico definitivo**, devuelve **exactamente un** item con:
+  {
+    "name": "Información insuficiente",
+    "active_principle": "N/A",
+    "dose": 0,
+    "dose_unit": "mg/kg",
+    "presentation": "N/A",
+    "frequency": "N/A",
+    "quantity": 0,
+    "quantity_unit": "días",
+    "notes": "Contexto insuficiente para prescribir con seguridad; agrega signos, constantes y/o diagnóstico definitivo."
+  }
+No agregues campos fuera del esquema.
 """
     user_context = {
         "task": "therapeutic_plan",
         "session_snapshot": session,
+        "previous": {"definitive_diagnosis": definitive_diagnosis} if definitive_diagnosis else {},
         "format_expectations": {"dose_unit": "mg/kg", "quantity_unit": "días"},
     }
     return await _structured_call("prescription", PRESCRIPTION_SCHEMA, system_prompt, user_context)
 
-async def gen_complementary_treatments_from_llm(session: Dict[str, Any]) -> Dict[str, Any]:
+
+
+
+async def gen_complementary_treatments_for_consultation(consultation_id: int | str) -> Dict[str, Any]:
+    session = await build_session_snapshot_from_consultation(consultation_id)
+    definitive = await fetch_definitive_diagnosis(consultation_id)
+    meds = await fetch_prescribed_medications(consultation_id)
+
+    return await gen_complementary_treatments_from_llm(
+        session,
+        definitive_diagnosis=definitive if any((definitive or {}).values()) else None,
+        prescribed_medications=meds if meds else None,
+    )
+
+
+async def gen_complementary_treatments_from_llm(
+    session: Dict[str, Any],
+    *,
+    definitive_diagnosis: Optional[Dict[str, Any]] = None,
+    prescribed_medications: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     system_prompt = """
 Eres un asistente clínico veterinario. Devuelve **solo** el JSON pedido.
-Objetivo: tratamientos complementarios (fluidoterapia, dieta, probióticos, etc.).
+Objetivo: tratamientos complementarios (p. ej., fluidoterapia, dieta, analgésicos no-farmacológicos, probióticos).
+
 Cada `item`:
 - `name` (intervención)
 - `quantity` (rango/tiempo en texto)
 - `notes` (instrucciones breves)
-Sin campos extra.
+
+Usa TODA la información disponible:
+- Contexto clínico (anamnesis, signos, constantes y examen físico).
+- **Diagnóstico definitivo** del/la veterinario/a (si existe).
+- **Medicaciones prescritas** en esta consulta (si existen) para evitar duplicidad o interacciones.
+
+Reglas:
+- No inventes datos fuera del contexto y mantén recomendaciones seguras para la especie.
+- Prioriza medidas de soporte y cuidados en casa coherentes con el diagnóstico y con los fármacos indicados.
+- **Abstención estructurada**: si el contexto es insuficiente y NO hay diagnóstico definitivo ni medicación prescrita,
+  devuelve **exactamente un** item con:
+  {
+    "name": "Información insuficiente",
+    "quantity": "N/A",
+    "notes": "Contexto insuficiente para proponer tratamientos complementarios; agrega signos, constantes, diagnóstico definitivo y/o medicación."
+  }
+No agregues campos fuera del esquema.
 """
-    user_context = {"task": "complementary_treatments", "session_snapshot": session}
+    user_context = {
+        "task": "complementary_treatments",
+        "session_snapshot": session,
+        "previous": {
+            **({"definitive_diagnosis": definitive_diagnosis} if definitive_diagnosis else {}),
+            **({"prescribed_medications": prescribed_medications} if prescribed_medications else {}),
+        },
+    }
     return await _structured_call("complementary_treatments", COMPLEMENTARIES_SCHEMA, system_prompt, user_context)

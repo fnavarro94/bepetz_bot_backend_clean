@@ -21,10 +21,19 @@ from google.cloud import firestore
 
 from common.broker import vet_broker
 from common.llm_vet import (
+    
     gen_diagnostics_from_llm,
     gen_additional_exams_from_llm,
     gen_prescription_from_llm,
     gen_complementary_treatments_from_llm,)
+
+from common.llm_vet import (
+    gen_diagnostics_for_consultation, 
+    gen_additional_exams_for_consultation, 
+    gen_prescription_for_consultation,
+    gen_complementary_treatments_for_consultation
+)
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("vet-worker")
@@ -61,6 +70,24 @@ else:
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
+
+import signal, asyncio, logging
+logger = logging.getLogger("vet-worker")
+
+SHUTTING_DOWN = False
+def _install_signal_logging():
+    def _on(sig):
+        global SHUTTING_DOWN
+        SHUTTING_DOWN = True
+        logger.error("Received signal %s → beginning graceful shutdown", sig)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            asyncio.get_event_loop().add_signal_handler(sig, lambda s=sig: _on(s))
+        except NotImplementedError:
+            # Fallback (Windows / limited envs)
+            signal.signal(sig, lambda *_: _on(sig))
+
+_install_signal_logging()
 
 def _vet_channel(session_id: str) -> str:
     return f"vet:{session_id}"
@@ -298,66 +325,167 @@ def _draft_diagnostics_from_session(session: dict) -> dict:
         ],
     }
 
+
+
+
+#-------------------------------------------------------------------------------
+# Cancell Helpers
+#-------------------------------------------------------------------------------
+# --- add near other imports ---
+import asyncio, json
+
+# --- helper: create a cancel Event wired to Redis Pub/Sub ---
+async def _make_cancel_event(session_id: str, kind: str) -> asyncio.Event:
+    ev = asyncio.Event()
+    if not redis_stream:
+        print(f"no redis stream found so sending cancel event")
+        return ev
+    print(f"redis_stream was found so running code")
+    async def listener():
+        pubsub = redis_stream.pubsub()
+        await pubsub.subscribe(f"vet:{session_id}:control")
+        try:
+            async for msg in pubsub.listen():
+                if msg.get("type") != "message":
+                    continue
+                data = msg.get("data")
+                try:
+                    obj = json.loads(data) if isinstance(data, str) else None
+                except Exception:
+                    obj = None
+                if isinstance(obj, dict) and obj.get("event") == "cancel":
+                    k = (obj.get("data") or {}).get("kind")
+                    if k in (kind, "*"):
+                        ev.set()
+                        break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                await pubsub.unsubscribe(f"vet:{session_id}:control")
+                await pubsub.close()
+            except Exception:
+                pass
+
+    asyncio.create_task(listener())
+    return ev
+
+# --- helper: run a long awaitable unless cancel_event fires ---
+import traceback
+class UserCancelled(Exception):
+    pass
+from contextlib import suppress
+import asyncio
+
+async def _wait_for_cancel_or(coro, cancel_event: asyncio.Event, label: str = ""):
+    t_main = asyncio.create_task(coro, name=f"main:{label}")
+    t_cancel = asyncio.create_task(cancel_event.wait(), name=f"cancel:{label}")
+    try:
+        done, _ = await asyncio.wait({t_main, t_cancel}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # External runtime cancellation (e.g., worker shutdown)
+        logger.error("Outer/runtime cancellation while waiting (label=%s). "
+                     "t_main.done=%s t_main.cancelled=%s",
+                     label, t_main.done(), t_main.cancelled(), exc_info=True)
+        t_main.cancel()
+        with suppress(asyncio.CancelledError):
+            await t_main
+        raise
+
+    # User-triggered cancel path
+    if t_cancel in done and cancel_event.is_set():
+        t_main.cancel()
+        with suppress(asyncio.CancelledError):
+            await t_main
+        raise UserCancelled()
+
+    # Normal path: main finished first; cancel the cancel-waiter cleanly
+    t_cancel.cancel()
+    with suppress(asyncio.CancelledError):
+        await t_cancel
+    return await t_main
+# --- helper: common cancelled pathway ---
+async def _handle_cancelled(session_id: str, kind: str):
+    await _publish_status(session_id, "status", phase=f"{kind}-cancelled")
+    try:
+        await _persist_output(session_id, kind, {"status": "cancelled"})
+    except Exception:
+        logger.warning("Persist cancel marker failed (session=%s kind=%s)", session_id, kind)
+
+
+
 # ------------------------------------------------------------------------------
 # Taskiq tasks (queueable from API)
 # ------------------------------------------------------------------------------
+
+from typing import Optional, List
+
 @vet_broker.task
 async def run_diagnostics_task(session_id: str) -> None:
-    """Queueable task: emit a minimal list of differentials + persist it."""
-    print("running diagnostics task")
+    kind = "diagnostics"
     await _publish_status(session_id, "status", phase="diagnostics-started")
+    cancel_event = await _make_cancel_event(session_id, kind)
+
     try:
-        # (Optional) fetch dummy session data – not used for the static payload,
-        # but keep it here in case you want to branch later.
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
-
-         # Generate via LLM (Structured Outputs); fallback to old static list on failure.
+        # Don’t force int(session_id) – allow both:
+        consultation_id: Optional[int | str]
         try:
-            payload = await gen_diagnostics_from_llm(session)
-            print(f"the payload was {payload}")
-        except Exception as e:
-            logger.warning("LLM diagnostics failed; falling back to stub. reason=%s", e)
-            items = _build_dummy_differentials(session)
-            payload = {"items": items}
+            consultation_id = int(session_id)
+        except ValueError:
+            consultation_id = session_id
 
-        # Stream to relay as a named SSE event: event='diagnostics', data=payload
+        payload = await _wait_for_cancel_or(
+            gen_diagnostics_for_consultation(consultation_id),
+            cancel_event,
+            label=f"{kind}:{session_id}",
+        )
+
         await _publish_status(session_id, "diagnostics", **payload)
-
-        # Persist the same JSON so the UI can fetch it later if desired
         await _persist_output(session_id, "diagnostics", payload)
-
         await _publish_status(session_id, "status", phase="diagnostics-finished")
         await _publish_status(session_id, "done", kind="diagnostics")
-        logger.info("Diagnostics completed (session=%s)", session_id)
+
+    except UserCancelled:
+        await _handle_cancelled(session_id, kind)
+
+    except asyncio.CancelledError as e:
+        # Runtime cancellation — log with stack + shutdown bit
+        logger.exception("Runtime cancelled task (user_cancel=%s, shutting_down=%s)",
+                         cancel_event.is_set(), SHUTTING_DOWN)
+        await _publish_status(
+            session_id, "error",
+            message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
+        )
+        # Optional: re-raise to let the broker see it
+        # raise
+
     except Exception as e:
+        logger.exception("Diagnostics failed")
+        items = _build_dummy_differentials({})
+        await _publish_status(session_id, "diagnostics", items=items)
+        await _persist_output(session_id, "diagnostics", {"items": items})
         await _publish_status(session_id, "error", message=str(e))
-        logger.exception("Diagnostics failed (session=%s): %s", session_id, e)
 
 @vet_broker.task
 async def run_additional_exams_task(session_id: str) -> None:
-    """Queueable task: emit a minimal list of complementary exams + persist it."""
+    """Queueable task: propose additional exams using DB context + vet's definitive diagnosis; persist result."""
     await _publish_status(session_id, "status", phase="additional-exams-started")
     try:
-        # Keep fetch in case you want to branch by session later
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
+        consultation_id = session_id  # string is fine; SQL uses ::bigint casts
 
-        # Build ONLY what the UI needs for the form
+        # Call LLM with full context (always). Prompt handles "Información insuficiente" when needed.
         try:
-            payload = await gen_additional_exams_from_llm(session)
+            # requires: from common.llm_vet import gen_additional_exams_for_consultation
+            payload = await gen_additional_exams_for_consultation(consultation_id)
         except Exception as e:
             logger.warning("LLM additional_exams failed; falling back to stub. reason=%s", e)
             payload = {
                 "items": [
-                    {"name": "Urianálisis", "indications": "Examen físico, químico y microscópico de orina."},
-                    {"name": "Radiografía abdominal", "indications": "Proyecciones latero-lateral y ventro-dorsal."},
+                    {
+                        "name": "Información insuficiente",
+                        "indications": "Fallo del servicio LLM o de red; respuesta de respaldo.",
+                        "priority": "baja",
+                    }
                 ]
             }
 
@@ -370,6 +498,7 @@ async def run_additional_exams_task(session_id: str) -> None:
         await _publish_status(session_id, "status", phase="additional-exams-finished")
         await _publish_status(session_id, "done", kind="additional-exams")
         logger.info("Additional exams completed (session=%s)", session_id)
+
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Additional exams failed (session=%s): %s", session_id, e)
@@ -380,19 +509,30 @@ async def run_prescription_task(session_id: str) -> None:
     """Queueable task: emit medications list for the 'Plan terapéutico / Medicación' UI."""
     await _publish_status(session_id, "status", phase="prescription-started")
     try:
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
+        consultation_id = session_id  # string OK; SQL casts use ::bigint in queries
 
         try:
-           payload = await gen_prescription_from_llm(session)
+            # requires: from common.llm_vet import gen_prescription_for_consultation
+            payload = await gen_prescription_for_consultation(consultation_id)
         except Exception as e:
             logger.warning("LLM prescription failed; falling back to stub. reason=%s", e)
-            payload = {"items": _build_dummy_medications(session)}
+            payload = {
+                "items": [
+                    {
+                        "name": "Información insuficiente",
+                        "active_principle": "N/A",
+                        "dose": 0,
+                        "dose_unit": "mg/kg",
+                        "presentation": "N/A",
+                        "frequency": "N/A",
+                        "quantity": 0,
+                        "quantity_unit": "días",
+                        "notes": "Fallo del servicio LLM o de red; respuesta de respaldo.",
+                    }
+                ]
+            }
 
-        # Stream to SSE relay with the named event this panel listens to
+        # Stream to SSE that this panel listens to
         await _publish_status(session_id, "prescription", **payload)
 
         # Persist
@@ -406,24 +546,29 @@ async def run_prescription_task(session_id: str) -> None:
         logger.exception("Prescription failed (session=%s): %s", session_id, e)
 
 
+
 @vet_broker.task
 async def run_complementary_treatments_task(session_id: str) -> None:
     """Queueable task: emit complementary treatments list for the UI."""
     await _publish_status(session_id, "status", phase="complementary-treatments-started")
     try:
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
+        consultation_id = session_id  # string OK; SQL uses ::bigint casts
 
         try:
-            payload = await gen_complementary_treatments_from_llm(session)
+            payload = await gen_complementary_treatments_for_consultation(consultation_id)
         except Exception as e:
             logger.warning("LLM complementary_treatments failed; falling back to stub. reason=%s", e)
-            payload = {"items": _build_dummy_complementaries(session)}
+            payload = {
+                "items": [
+                    {
+                        "name": "Información insuficiente",
+                        "quantity": "N/A",
+                        "notes": "Fallo del servicio LLM o de red; respuesta de respaldo.",
+                    }
+                ]
+            }
 
-        # Named event must be 'complementary_treatments'
+        # Named event must be 'complementary-treatments'
         await _publish_status(session_id, "complementary-treatments", **payload)
 
         # Persist
