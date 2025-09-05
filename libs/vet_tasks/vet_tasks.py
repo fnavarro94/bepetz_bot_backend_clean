@@ -21,10 +21,27 @@ from google.cloud import firestore
 
 from common.broker import vet_broker
 from common.llm_vet import (
+    
     gen_diagnostics_from_llm,
     gen_additional_exams_from_llm,
     gen_prescription_from_llm,
     gen_complementary_treatments_from_llm,)
+
+from common.llm_vet import (
+    gen_diagnostics_for_consultation, 
+    gen_additional_exams_for_consultation, 
+    gen_prescription_for_consultation,
+    gen_complementary_treatments_for_consultation
+)
+
+from common.llm_vet import (
+    LLMUserCancelled,
+    gen_diagnostics_for_consultation_cancelable,
+    gen_additional_exams_for_consultation_cancelable,
+    gen_prescription_for_consultation_cancelable,
+    gen_complementary_treatments_for_consultation_cancelable,
+)
+import contextlib 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("vet-worker")
@@ -61,6 +78,24 @@ else:
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
+
+import signal, asyncio, logging
+logger = logging.getLogger("vet-worker")
+
+SHUTTING_DOWN = False
+def _install_signal_logging():
+    def _on(sig):
+        global SHUTTING_DOWN
+        SHUTTING_DOWN = True
+        logger.error("Received signal %s → beginning graceful shutdown", sig)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            asyncio.get_event_loop().add_signal_handler(sig, lambda s=sig: _on(s))
+        except NotImplementedError:
+            # Fallback (Windows / limited envs)
+            signal.signal(sig, lambda *_: _on(sig))
+
+_install_signal_logging()
 
 def _vet_channel(session_id: str) -> str:
     return f"vet:{session_id}"
@@ -298,68 +333,195 @@ def _draft_diagnostics_from_session(session: dict) -> dict:
         ],
     }
 
+
+
+
+#-------------------------------------------------------------------------------
+# Cancell Helpers
+#-------------------------------------------------------------------------------
+# --- add near other imports ---
+import asyncio, json
+
+# --- helper: create a cancel Event wired to Redis Pub/Sub (durable+ephemeral) ---
+async def _make_cancel_event(session_id: str, kind: str) -> asyncio.Event:
+    ev = asyncio.Event()
+    if not redis_stream:
+        return ev
+
+    channel  = f"vet:{session_id}:control"
+    flag_key = f"vet:{session_id}:{kind}:cancelled"
+
+    pubsub = redis_stream.pubsub()
+    await pubsub.subscribe(channel)  # 1) subscribe first (catch future publishes)
+
+    # 2) then check the durable sticky flag (catch past cancels)
+    try:
+        if await redis_stream.get(flag_key):
+            ev.set()
+            # We won't need the listener; clean up right away
+            with suppress(Exception):
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            return ev
+    except Exception:
+        # Non-fatal; fall through to live listening
+        pass
+
+    async def listener():
+        try:
+            async for msg in pubsub.listen():
+                if msg.get("type") != "message":
+                    continue
+                try:
+                    data = json.loads(msg["data"])
+                except Exception:
+                    continue
+                if data.get("event") == "cancel":
+                    k = (data.get("data") or {}).get("kind")
+                    # Keep it strict (no '*' wildcard unless you truly need it)
+                    if k == kind:
+                        ev.set()
+                        break
+        finally:
+            with suppress(Exception):
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+
+    asyncio.create_task(listener())
+    return ev
+
+
+# --- helper: run a long awaitable unless cancel_event fires ---
+import traceback
+class UserCancelled(Exception):
+    pass
+from contextlib import suppress
+import asyncio
+
+async def _wait_for_cancel_or(coro, cancel_event: asyncio.Event, label: str = ""):
+    t_main = asyncio.create_task(coro, name=f"main:{label}")
+    t_cancel = asyncio.create_task(cancel_event.wait(), name=f"cancel:{label}")
+    try:
+        done, _ = await asyncio.wait({t_main, t_cancel}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # External runtime cancellation (e.g., worker shutdown)
+        logger.error("Outer/runtime cancellation while waiting (label=%s). "
+                     "t_main.done=%s t_main.cancelled=%s",
+                     label, t_main.done(), t_main.cancelled(), exc_info=True)
+        t_main.cancel()
+        with suppress(asyncio.CancelledError):
+            await t_main
+        raise
+
+    # User-triggered cancel path
+    if t_cancel in done and cancel_event.is_set():
+        t_main.cancel()
+        with suppress(asyncio.CancelledError):
+            await t_main
+        raise UserCancelled()
+
+    # Normal path: main finished first; cancel the cancel-waiter cleanly
+    t_cancel.cancel()
+    with suppress(asyncio.CancelledError):
+        await t_cancel
+    return await t_main
+
+
+# --- add this tiny helper (or inline the mapping if you prefer) ---
+def _hyphen_kind(kind: str) -> str:
+    if kind == "additional_exams":
+        return "additional-exams"
+    if kind == "complementary_treatments":
+        return "complementary-treatments"
+    return kind  # diagnostics/prescription already hyphen-free
+
+
+# --- helper: common cancelled pathway ---
+# tasks/vet_tasks.py
+async def _handle_cancelled(session_id: str, kind: str):
+    ek = _hyphen_kind(kind)  # <-- hard-code to hyphen names
+    await _publish_status(session_id, "status", phase=f"{ek}-cancelled")
+    await _publish_status(session_id, "cancelled", kind=ek)
+    await _publish_status(session_id, "done", kind=ek, cancelled=True)
+
+    async def _bg_persist_and_clear():
+        with suppress(Exception):
+            await _persist_output(session_id, kind, {"status": "cancelled"})
+        if redis_stream:
+            with suppress(Exception):
+                await redis_stream.delete(f"vet:{session_id}:{kind}:cancelled")
+    asyncio.create_task(_bg_persist_and_clear())
+
+
+
 # ------------------------------------------------------------------------------
 # Taskiq tasks (queueable from API)
 # ------------------------------------------------------------------------------
+
+from typing import Optional, List
+
 @vet_broker.task
 async def run_diagnostics_task(session_id: str) -> None:
-    """Queueable task: emit a minimal list of differentials + persist it."""
-    print("running diagnostics task")
+    kind = "diagnostics"
     await _publish_status(session_id, "status", phase="diagnostics-started")
+    cancel_event = await _make_cancel_event(session_id, kind)
+
     try:
-        # (Optional) fetch dummy session data – not used for the static payload,
-        # but keep it here in case you want to branch later.
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
-
-         # Generate via LLM (Structured Outputs); fallback to old static list on failure.
+        # Don’t force int(session_id) – allow both:
+        consultation_id: Optional[int | str]
         try:
-            payload = await gen_diagnostics_from_llm(session)
-            print(f"the payload was {payload}")
-        except Exception as e:
-            logger.warning("LLM diagnostics failed; falling back to stub. reason=%s", e)
-            items = _build_dummy_differentials(session)
-            payload = {"items": items}
+            consultation_id = int(session_id)
+        except ValueError:
+            consultation_id = session_id
 
-        # Stream to relay as a named SSE event: event='diagnostics', data=payload
+        payload = await gen_diagnostics_for_consultation_cancelable(
+            consultation_id,
+            cancel_event=cancel_event,
+        )
+
         await _publish_status(session_id, "diagnostics", **payload)
-
-        # Persist the same JSON so the UI can fetch it later if desired
         await _persist_output(session_id, "diagnostics", payload)
-
         await _publish_status(session_id, "status", phase="diagnostics-finished")
         await _publish_status(session_id, "done", kind="diagnostics")
-        logger.info("Diagnostics completed (session=%s)", session_id)
+
+    except LLMUserCancelled:
+        await _handle_cancelled(session_id, kind)
+
+    except asyncio.CancelledError:
+        logger.exception("Runtime cancelled task (user_cancel=%s, shutting_down=%s)",
+                         cancel_event.is_set(), SHUTTING_DOWN)
+        if cancel_event.is_set():
+            await _handle_cancelled(session_id, kind)
+        else:
+            ek = _hyphen_kind(kind)
+            await _publish_status(
+                session_id, "error",
+                message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
+            )
+            await _publish_status(session_id, "done", kind=ek, error=True)
+        return
+
     except Exception as e:
+        logger.exception("Diagnostics failed")
+        items = _build_dummy_differentials({})
+        await _publish_status(session_id, "diagnostics", items=items)
+        await _persist_output(session_id, "diagnostics", {"items": items})
         await _publish_status(session_id, "error", message=str(e))
-        logger.exception("Diagnostics failed (session=%s): %s", session_id, e)
+        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
+
 
 @vet_broker.task
 async def run_additional_exams_task(session_id: str) -> None:
-    """Queueable task: emit a minimal list of complementary exams + persist it."""
+    """Queueable task: propose additional exams using DB context + vet's definitive diagnosis; persist result."""
+    kind = "additional_exams"
     await _publish_status(session_id, "status", phase="additional-exams-started")
-    try:
-        # Keep fetch in case you want to branch by session later
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
+    cancel_event = await _make_cancel_event(session_id, kind)
 
-        # Build ONLY what the UI needs for the form
-        try:
-            payload = await gen_additional_exams_from_llm(session)
-        except Exception as e:
-            logger.warning("LLM additional_exams failed; falling back to stub. reason=%s", e)
-            payload = {
-                "items": [
-                    {"name": "Urianálisis", "indications": "Examen físico, químico y microscópico de orina."},
-                    {"name": "Radiografía abdominal", "indications": "Proyecciones latero-lateral y ventro-dorsal."},
-                ]
-            }
+    try:
+        payload = await gen_additional_exams_for_consultation_cancelable(
+            consultation_id=session_id,   # string OK
+            cancel_event=cancel_event,
+        )
 
         # Stream to relay as a named SSE event
         await _publish_status(session_id, "additional-exams", **payload)
@@ -370,29 +532,56 @@ async def run_additional_exams_task(session_id: str) -> None:
         await _publish_status(session_id, "status", phase="additional-exams-finished")
         await _publish_status(session_id, "done", kind="additional-exams")
         logger.info("Additional exams completed (session=%s)", session_id)
+
+    except LLMUserCancelled:
+        await _handle_cancelled(session_id, kind)
+
+    except asyncio.CancelledError:
+        logger.exception("Runtime cancelled task (user_cancel=%s, shutting_down=%s)",
+                         cancel_event.is_set(), SHUTTING_DOWN)
+        if cancel_event.is_set():
+            await _handle_cancelled(session_id, kind)
+        else:
+            ek = _hyphen_kind(kind)
+            await _publish_status(
+                session_id, "error",
+                message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
+            )
+            await _publish_status(session_id, "done", kind=ek, error=True)
+        return
+
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Additional exams failed (session=%s): %s", session_id, e)
+        # Fallback stub
+        payload = {
+            "items": [
+                {
+                    "name": "Información insuficiente",
+                    "indications": "Fallo del servicio LLM o de red; respuesta de respaldo.",
+                    "priority": "baja",
+                }
+            ]
+        }
+        await _publish_status(session_id, "additional-exams", **payload)
+        await _persist_output(session_id, "additional_exams", payload)
+        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
 
 
 @vet_broker.task
 async def run_prescription_task(session_id: str) -> None:
     """Queueable task: emit medications list for the 'Plan terapéutico / Medicación' UI."""
+    kind = "prescription"
     await _publish_status(session_id, "status", phase="prescription-started")
+    cancel_event = await _make_cancel_event(session_id, kind)
+
     try:
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
+        payload = await gen_prescription_for_consultation_cancelable(
+            consultation_id=session_id,   # string OK
+            cancel_event=cancel_event,
+        )
 
-        try:
-           payload = await gen_prescription_from_llm(session)
-        except Exception as e:
-            logger.warning("LLM prescription failed; falling back to stub. reason=%s", e)
-            payload = {"items": _build_dummy_medications(session)}
-
-        # Stream to SSE relay with the named event this panel listens to
+        # Stream to SSE that this panel listens to
         await _publish_status(session_id, "prescription", **payload)
 
         # Persist
@@ -401,29 +590,62 @@ async def run_prescription_task(session_id: str) -> None:
         await _publish_status(session_id, "status", phase="prescription-finished")
         await _publish_status(session_id, "done", kind="prescription")
         logger.info("Prescription completed (session=%s)", session_id)
+
+    except LLMUserCancelled:
+        await _handle_cancelled(session_id, kind)
+
+    except asyncio.CancelledError:
+        logger.exception("Runtime cancelled task (user_cancel=%s, shutting_down=%s)",
+                         cancel_event.is_set(), SHUTTING_DOWN)
+        if cancel_event.is_set():
+            await _handle_cancelled(session_id, kind)
+        else:
+            ek = _hyphen_kind(kind)
+            await _publish_status(
+                session_id, "error",
+                message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
+            )
+            await _publish_status(session_id, "done", kind=ek, error=True)
+        return
+
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Prescription failed (session=%s): %s", session_id, e)
+        # Fallback stub
+        payload = {
+            "items": [
+                {
+                    "name": "Información insuficiente",
+                    "active_principle": "N/A",
+                    "dose": 0,
+                    "dose_unit": "mg/kg",
+                    "presentation": "N/A",
+                    "frequency": "N/A",
+                    "quantity": 0,
+                    "quantity_unit": "días",
+                    "notes": "Fallo del servicio LLM o de red; respuesta de respaldo.",
+                }
+            ]
+        }
+        await _publish_status(session_id, "prescription", **payload)
+        await _persist_output(session_id, "prescription", payload)
+        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
 
 
 @vet_broker.task
 async def run_complementary_treatments_task(session_id: str) -> None:
     """Queueable task: emit complementary treatments list for the UI."""
+    kind = "complementary_treatments"
     await _publish_status(session_id, "status", phase="complementary-treatments-started")
+    cancel_event = await _make_cancel_event(session_id, kind)
+
     try:
-        session = await _fetch_vet_session(session_id)
-        if not session:
-            await _publish_status(session_id, "error", message="No dummy data available for session")
-            logger.warning("No dummy session data: %s", session_id)
-            return
+        payload = await gen_complementary_treatments_for_consultation_cancelable(
+            consultation_id=session_id,   # string OK
+            cancel_event=cancel_event,
+        )
 
-        try:
-            payload = await gen_complementary_treatments_from_llm(session)
-        except Exception as e:
-            logger.warning("LLM complementary_treatments failed; falling back to stub. reason=%s", e)
-            payload = {"items": _build_dummy_complementaries(session)}
-
-        # Named event must be 'complementary_treatments'
+        # Named event must be 'complementary-treatments'
         await _publish_status(session_id, "complementary-treatments", **payload)
 
         # Persist
@@ -432,6 +654,37 @@ async def run_complementary_treatments_task(session_id: str) -> None:
         await _publish_status(session_id, "status", phase="complementary-treatments-finished")
         await _publish_status(session_id, "done", kind="complementary-treatments")
         logger.info("Complementary treatments completed (session=%s)", session_id)
+
+    except LLMUserCancelled:
+        await _handle_cancelled(session_id, kind)
+
+    except asyncio.CancelledError:
+        logger.exception("Runtime cancelled task (user_cancel=%s, shutting_down=%s)",
+                         cancel_event.is_set(), SHUTTING_DOWN)
+        if cancel_event.is_set():
+            await _handle_cancelled(session_id, kind)
+        else:
+            ek = _hyphen_kind(kind)
+            await _publish_status(
+                session_id, "error",
+                message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
+            )
+            await _publish_status(session_id, "done", kind=ek, error=True)
+        return
+
     except Exception as e:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Complementary treatments failed (session=%s): %s", session_id, e)
+        # Fallback stub
+        payload = {
+            "items": [
+                {
+                    "name": "Información insuficiente",
+                    "quantity": "N/A",
+                    "notes": "Fallo del servicio LLM o de red; respuesta de respaldo.",
+                }
+            ]
+        }
+        await _publish_status(session_id, "complementary-treatments", **payload)
+        await _persist_output(session_id, "complementary_treatments", payload)
+        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)

@@ -478,3 +478,72 @@ async def queue_vet_complementary(session_id: str):
         raise RuntimeError("Complementary-treatments worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_complementary_treatments_task.kiq(session_id=session_id)
     return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="complementary_treatments")
+
+
+
+### Cancel code
+# --- imports (top of file, near others) ---
+import json
+import redis.asyncio as aioredis
+from enum import Enum
+from pydantic import BaseModel
+
+# --- streaming/control Redis (same env you use in relay/worker) ---
+STREAM_REDIS_HOST = os.getenv("STREAM_REDIS_HOST", "localhost")
+STREAM_REDIS_PORT = int(os.getenv("STREAM_REDIS_PORT", "6379"))
+STREAM_REDIS_SSL  = os.getenv("STREAM_REDIS_SSL", "false").lower() == "true"
+
+redis_stream = aioredis.Redis(
+    host=STREAM_REDIS_HOST,
+    port=STREAM_REDIS_PORT,
+    ssl=STREAM_REDIS_SSL,
+    encoding="utf-8",
+    decode_responses=True,
+)
+
+# --- small models ---
+class VetKind(str, Enum):
+    diagnostics = "diagnostics"
+    additional_exams = "additional_exams"
+    prescription = "prescription"
+    complementary_treatments = "complementary_treatments"
+
+class VetCancelResponse(BaseModel):
+    status: str
+    session_id: str
+    kind: str
+
+
+
+# --- NEW: cooperative cancel endpoint ---
+@app.post("/api/v1/vet/{session_id}/{kind}/cancel",
+          response_model=VetCancelResponse,
+          status_code=status.HTTP_202_ACCEPTED)
+async def cancel_vet_step(session_id: str, kind: VetKind):
+    """
+    Durable + low-latency cancel:
+      1) SET a sticky cancel key with TTL (so late subscribers still see it)
+      2) PUBLISH a control message (so already-subscribed workers react instantly)
+      3) Optionally nudge UIs on the general channel
+    """
+    control_channel = f"vet:{session_id}:control"
+    flag_key = f"vet:{session_id}:{kind.value}:cancelled"
+
+    payload = {"event": "cancel", "data": {"kind": kind.value}}
+    # UTC timestamp for debugging; avoid needing timezone import
+    stamp = {"ts": datetime.utcnow().isoformat() + "Z"}
+
+    # Order matters: SET (durable) then PUBLISH (ephemeral)
+    pipe = redis_stream.pipeline()
+    pipe.set(flag_key, json.dumps(stamp), ex=3600)               # sticky bit with TTL (1h)
+    pipe.publish(control_channel, json.dumps(payload))           # fast notify
+    await pipe.execute()
+
+    # Optional: UI nudge on the public channel
+    await redis_stream.publish(
+        f"vet:{session_id}",
+        json.dumps({"event": "status", "data": {"phase": f"{kind.value}-cancel-requested"}})
+    )
+
+    return VetCancelResponse(status="cancel-requested", session_id=session_id, kind=kind.value)
+
