@@ -1,0 +1,17 @@
+# Task queue & Redis broker
+taskiq==0.11.17
+taskiq-redis==1.0.9
+redis==5.3.0
+
+# Firestore (for consultation_id ↔ response_id mapping)
+google-cloud-firestore==2.21.0
+
+# OpenAI client (Async + Responses streaming)
+openai==1.105.0
+
+# Cloud Run /healthz shim
+fastapi==0.115.14
+uvicorn==0.35.0
+
+# Local dev convenience (env files)
+python-dotenv==1.1.1

@@ -30,6 +30,7 @@ import asyncio
 from google.cloud.firestore_v1 import FieldFilter  # for equality filters
 
 # ── New: Vet workflow tasks (Diagnostics / Exams / Prescription / Complementary) ──
+from vet_chat_tasks.vet_chat_tasks import process_vet_chat_message_task
 try:
     # when the new worker file is added (below), these imports will resolve
     from vet_tasks.vet_tasks import (
@@ -737,3 +738,52 @@ async def get_vet_output(session_id: str, kind: str):
     d = snap.to_dict() or {}
     return VetOutputResponse(kind=k, updated_at=d.get("updated_at"), result=d.get("result") or {})
 
+
+
+
+#--------------------------------------------------
+# Vet Chat Components
+#--------------------------------------------------
+
+class VetChatMessageRequest(BaseModel):
+    message: str
+    attachments: List[AttachmentMeta] = Field(default_factory=list)
+
+class VetChatQueueResponse(BaseModel):
+    status: str
+    task_id: str
+    consultation_id: str
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet-chat message endpoint (simple: consultation_id + message)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.post(
+    "/api/v1/vet_chat/{consultation_id}/message",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=VetChatQueueResponse,
+)
+async def queue_vet_chat_message(consultation_id: str, req: VetChatMessageRequest):
+    """
+    Minimal vet-chat flow:
+    - Accepts consultation_id and a message (+ optional attachments).
+    - Queues a worker job that:
+        * looks up/creates the OpenAI session for this consultation,
+        * sends the message,
+        * streams tokens to your FE (implementation detail in vet_chat_tasks),
+        * persists mapping consultation_id → openai_session_id for reuse.
+    """
+    if not process_vet_chat_message_task:
+        raise RuntimeError("Vet-chat worker not available. Did you deploy vet_chat_tasks/vet_chat_tasks.py?")
+
+    task = await process_vet_chat_message_task.kiq(
+        consultation_id=consultation_id,
+        message=req.message,
+        attachments=[a.dict() for a in req.attachments],
+    )
+
+    return VetChatQueueResponse(
+        status="queued",
+        task_id=task.task_id,
+        consultation_id=consultation_id,
+    )

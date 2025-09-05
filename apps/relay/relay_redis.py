@@ -298,6 +298,30 @@ async def ready_conv(conversation_id: str):
     val = await redis_stream.get(_ready_key(channel))
     return {"ready": bool(val)}
 
+
+# relay_redis.py  (add near the other routes)
+
+@app.get("/vet-chat-stream/{consultation_id}")
+async def vet_chat_stream(consultation_id: str):
+    """
+    Subscribe to the vet-chat stream for a consultation.
+    Worker publishes to Redis channel: vet_chat:{consultation_id}
+    Frontend connects with:  GET /vet-chat-stream/{consultation_id}
+    """
+    channel = f"vet_chat:{consultation_id}"
+    return await _sse_for_channel(channel, attach_label=f"vet-chat {consultation_id}")
+
+@app.get("/ready/vet-chat/{consultation_id}")
+async def ready_vet_chat(consultation_id: str):
+    """
+    Returns {"ready": true/false} if any client is attached to vet_chat:{consultation_id}.
+    Useful for the API/worker to avoid lost-first-chunk races.
+    """
+    channel = f"vet_chat:{consultation_id}"
+    val = await redis_stream.get(_ready_key(channel))
+    return {"ready": bool(val)}
+
+
 # ── RUN ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
