@@ -1,12 +1,12 @@
 # ==============================================================================
-# File: tasks/vet_tasks.py  –  Vet workflow worker (independent from chat worker)
+# File: tasks/vet_tasks_underscorees.py  –  Vet workflow worker (underscore-standardized)
 # Purpose:
+#   • Copy of vet_tasks.py with all kinds, events, and phases standardized to underscores.
 #   • Exposes 4 Taskiq tasks:
 #       1) run_diagnostics_task(session_id)
 #       2) run_additional_exams_task(session_id)
 #       3) run_prescription_task(session_id)
 #       4) run_complementary_treatments_task(session_id)
-#   • DOES NOT read session input data from Firestore (uses dummy JSON).
 #   • Persists outputs to Firestore; reruns overwrite previous outputs.
 #   • Optional Redis status fanout on channel: f"vet:{session_id}"
 # ==============================================================================
@@ -21,17 +21,17 @@ from google.cloud import firestore
 
 from common.broker import vet_broker
 from common.llm_vet import (
-    
     gen_diagnostics_from_llm,
     gen_additional_exams_from_llm,
     gen_prescription_from_llm,
-    gen_complementary_treatments_from_llm,)
+    gen_complementary_treatments_from_llm,
+)
 
 from common.llm_vet import (
-    gen_diagnostics_for_consultation, 
-    gen_additional_exams_for_consultation, 
+    gen_diagnostics_for_consultation,
+    gen_additional_exams_for_consultation,
     gen_prescription_for_consultation,
-    gen_complementary_treatments_for_consultation
+    gen_complementary_treatments_for_consultation,
 )
 
 from common.llm_vet import (
@@ -41,7 +41,7 @@ from common.llm_vet import (
     gen_prescription_for_consultation_cancelable,
     gen_complementary_treatments_for_consultation_cancelable,
 )
-import contextlib 
+import contextlib
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("vet-worker")
@@ -117,25 +117,18 @@ async def _publish_status(session_id: str, event: str, **fields) -> None:
 # Priority:
 # 1) If VET_DUMMY_SESSIONS_JSON is set (JSON map of session_id->object), use it.
 # 2) Else, generate a deterministic stub from session_id.
-#
-# Example env:
-# export VET_DUMMY_SESSIONS_JSON='{
-#   "sess-123": {"patient":{"species":"canine","breed":"Lab","age":6,"sex":"M","weight_kg":28},
-#                "complaints":["vomiting","lethargy"], "vitals":{"temp_c":39.6,"hr_bpm":120,"rr_bpm":28},
-#                "exam":{"findings":"abdominal discomfort","dehydration":2}, "history":{"diet":"kibble"} }
-# }'
 
 def _env_dummy_map() -> dict:
     try:
         data = {
-                    "sess-gi": {
-                        "patient": {"species":"canine","breed":"Beagle","age":5,"sex":"F","weight_kg":11.4},
-                        "complaints": ["Vomiting","Diarrhea"],
-                        "vitals": {"temp_c":39.7,"hr_bpm":118,"rr_bpm":30,"bcs":5,"mucous_membranes":"pink"},
-                        "exam": {"findings":"Abdominal discomfort","dehydration":2},
-                        "history": {"diet":"kibble","vaccines":"up-to-date"}
-                    }
-                }
+            "sess-gi": {
+                "patient": {"species":"canine","breed":"Beagle","age":5,"sex":"F","weight_kg":11.4},
+                "complaints": ["Vomiting","Diarrhea"],
+                "vitals": {"temp_c":39.7,"hr_bpm":118,"rr_bpm":30,"bcs":5,"mucous_membranes":"pink"},
+                "exam": {"findings":"Abdominal discomfort","dehydration":2},
+                "history": {"diet":"kibble","vaccines":"up-to-date"}
+            }
+        }
         if isinstance(data, dict):
             return data
     except Exception as e:
@@ -187,11 +180,11 @@ def _build_dummy_medications(session: dict) -> list[dict]:
         {
             "name": "Maropitant",
             "active_principle": "Maropitant citrate",
-            "dose": 1.0,                 # numeric dose
-            "dose_unit": "mg/kg",        # unit shown next to 'Dosis'
+            "dose": 1.0,
+            "dose_unit": "mg/kg",
             "presentation": "Solución inyectable 10 mg/ml",
             "frequency": "cada 24 h",
-            "quantity": 3,               # number of days/packs/etc.
+            "quantity": 3,
             "quantity_unit": "días",
             "notes": "Antiemético. Administrar con alimento para reducir náuseas."
         },
@@ -278,7 +271,7 @@ async def _persist_output(session_id: str, kind: str, data: dict) -> None:
             "kind": kind,
             "updated_at": firestore.SERVER_TIMESTAMP,
         },
-        merge=False,  # ← overwrite semantics
+        merge=False,
     )
 
 # ------------------------------------------------------------------------------
@@ -334,15 +327,11 @@ def _draft_diagnostics_from_session(session: dict) -> dict:
     }
 
 
-
-
 #-------------------------------------------------------------------------------
-# Cancell Helpers
+# Cancel Helpers
 #-------------------------------------------------------------------------------
-# --- add near other imports ---
 import asyncio, json
 
-# --- helper: create a cancel Event wired to Redis Pub/Sub (durable+ephemeral) ---
 async def _make_cancel_event(session_id: str, kind: str) -> asyncio.Event:
     ev = asyncio.Event()
     if not redis_stream:
@@ -352,19 +341,16 @@ async def _make_cancel_event(session_id: str, kind: str) -> asyncio.Event:
     flag_key = f"vet:{session_id}:{kind}:cancelled"
 
     pubsub = redis_stream.pubsub()
-    await pubsub.subscribe(channel)  # 1) subscribe first (catch future publishes)
+    await pubsub.subscribe(channel)
 
-    # 2) then check the durable sticky flag (catch past cancels)
     try:
         if await redis_stream.get(flag_key):
             ev.set()
-            # We won't need the listener; clean up right away
             with suppress(Exception):
                 await pubsub.unsubscribe(channel)
                 await pubsub.close()
             return ev
     except Exception:
-        # Non-fatal; fall through to live listening
         pass
 
     async def listener():
@@ -378,7 +364,6 @@ async def _make_cancel_event(session_id: str, kind: str) -> asyncio.Event:
                     continue
                 if data.get("event") == "cancel":
                     k = (data.get("data") or {}).get("kind")
-                    # Keep it strict (no '*' wildcard unless you truly need it)
                     if k == kind:
                         ev.set()
                         break
@@ -391,7 +376,6 @@ async def _make_cancel_event(session_id: str, kind: str) -> asyncio.Event:
     return ev
 
 
-# --- helper: run a long awaitable unless cancel_event fires ---
 import traceback
 class UserCancelled(Exception):
     pass
@@ -404,54 +388,44 @@ async def _wait_for_cancel_or(coro, cancel_event: asyncio.Event, label: str = ""
     try:
         done, _ = await asyncio.wait({t_main, t_cancel}, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        # External runtime cancellation (e.g., worker shutdown)
-        logger.error("Outer/runtime cancellation while waiting (label=%s). "
-                     "t_main.done=%s t_main.cancelled=%s",
-                     label, t_main.done(), t_main.cancelled(), exc_info=True)
+        logger.error(
+            "Outer/runtime cancellation while waiting (label=%s). t_main.done=%s t_main.cancelled=%s",
+            label, t_main.done(), t_main.cancelled(), exc_info=True,
+        )
         t_main.cancel()
         with suppress(asyncio.CancelledError):
             await t_main
         raise
 
-    # User-triggered cancel path
     if t_cancel in done and cancel_event.is_set():
         t_main.cancel()
         with suppress(asyncio.CancelledError):
             await t_main
         raise UserCancelled()
 
-    # Normal path: main finished first; cancel the cancel-waiter cleanly
     t_cancel.cancel()
     with suppress(asyncio.CancelledError):
         await t_cancel
     return await t_main
 
 
-# --- add this tiny helper (or inline the mapping if you prefer) ---
 def _hyphen_kind(kind: str) -> str:
-    if kind == "additional_exams":
-        return "additional-exams"
-    if kind == "complementary_treatments":
-        return "complementary-treatments"
-    return kind  # diagnostics/prescription already hyphen-free
+    # Standardize to underscores everywhere; no hyphen mapping
+    return kind
 
 
-# --- helper: common cancelled pathway ---
-# tasks/vet_tasks.py
-# --- UPDATED: common cancelled pathway ----------------------------------------
 async def _handle_cancelled(session_id: str, kind: str):
-    ek = _hyphen_kind(kind)  # diagnostics / additional-exams / prescription / complementary-treatments
-    await _publish_status(session_id, "status", phase=f"{ek}-cancelled")
+    ek = _hyphen_kind(kind)
+    await _publish_status(session_id, "status", phase=f"{ek}_cancelled")
     await _publish_status(session_id, "cancelled", kind=ek)
     await _publish_status(session_id, "done", kind=ek, cancelled=True)
 
     async def _bg_persist_and_clear():
         with suppress(Exception):
-            # NEW: durable run-state and output marker
             await _persist_run_state(
                 session_id, kind,
                 status="cancelled",
-                phase=f"{ek}-cancelled",
+                phase=f"{ek}_cancelled",
                 finished_at=firestore.SERVER_TIMESTAMP,
             )
             await _persist_output(session_id, kind, {"status": "cancelled"})
@@ -461,14 +435,8 @@ async def _handle_cancelled(session_id: str, kind: str):
     asyncio.create_task(_bg_persist_and_clear())
 
 
-
-# --- NEW: persist run-state ----------------------------------------------------
+# --- persist run-state ---------------------------------------------------------
 async def _persist_run_state(session_id: str, kind: str, **fields) -> None:
-    """
-    Durable per-step state under:
-      vet_sessions/{session_id}/runs/{kind}
-    Merge-write with an automatic updated_at.
-    """
     ref = (
         db.collection("vet_sessions")
           .document(session_id)
@@ -488,15 +456,12 @@ from typing import Optional, List
 @vet_broker.task
 async def run_diagnostics_task(session_id: str) -> None:
     kind = "diagnostics"
-    await _publish_status(session_id, "status", phase="diagnostics-started")
-
-    # NEW: durable state → running
-    await _persist_run_state(session_id, kind, status="running", phase="diagnostics-started")
+    await _publish_status(session_id, "status", phase="diagnostics_started")
+    await _persist_run_state(session_id, kind, status="running", phase="diagnostics_started")
 
     cancel_event = await _make_cancel_event(session_id, kind)
 
     try:
-        # Accept both int and str for consultation_id
         try:
             consultation_id = int(session_id)
         except ValueError:
@@ -510,15 +475,14 @@ async def run_diagnostics_task(session_id: str) -> None:
         await _publish_status(session_id, "diagnostics", **payload)
         await _persist_output(session_id, "diagnostics", payload)
 
-        # NEW: durable state → done
         await _persist_run_state(
             session_id, kind,
             status="done",
-            phase="diagnostics-finished",
+            phase="diagnostics_finished",
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "status", phase="diagnostics-finished")
+        await _publish_status(session_id, "status", phase="diagnostics_finished")
         await _publish_status(session_id, "done", kind="diagnostics")
 
     except LLMUserCancelled:
@@ -535,11 +499,10 @@ async def run_diagnostics_task(session_id: str) -> None:
                 session_id, "error",
                 message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
             )
-            # NEW: durable state → error
             await _persist_run_state(
                 session_id, kind,
                 status="error",
-                phase=f"{ek}-runtime-cancel",
+                phase=f"{ek}_runtime_cancel",
                 error_message="Runtime cancelled task",
                 finished_at=firestore.SERVER_TIMESTAMP,
             )
@@ -553,48 +516,43 @@ async def run_diagnostics_task(session_id: str) -> None:
         await _persist_output(session_id, "diagnostics", {"items": items})
         await _publish_status(session_id, "error", message=str(e))
 
-        # NEW: durable state → error
         await _persist_run_state(
             session_id, kind,
             status="error",
-            phase="diagnostics-error",
+            phase="diagnostics_error",
             error_message=str(e),
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
+        await _publish_status(session_id, "done", kind=kind, error=True)
 
 
 @vet_broker.task
 async def run_additional_exams_task(session_id: str) -> None:
-    """Queueable task: propose additional exams using DB context + vet's definitive diagnosis; persist result."""
     kind = "additional_exams"
-    await _publish_status(session_id, "status", phase="additional-exams-started")
-
-    # NEW: durable state → running
-    await _persist_run_state(session_id, kind, status="running", phase="additional-exams-started")
+    await _publish_status(session_id, "status", phase="additional_exams_started")
+    await _persist_run_state(session_id, kind, status="running", phase="additional_exams_started")
 
     cancel_event = await _make_cancel_event(session_id, kind)
 
     try:
         payload = await gen_additional_exams_for_consultation_cancelable(
-            consultation_id=session_id,   # string OK
+            consultation_id=session_id,
             cancel_event=cancel_event,
         )
 
-        await _publish_status(session_id, "additional-exams", **payload)
+        await _publish_status(session_id, "additional_exams", **payload)
         await _persist_output(session_id, "additional_exams", payload)
 
-        # NEW: durable state → done
         await _persist_run_state(
             session_id, kind,
             status="done",
-            phase="additional-exams-finished",
+            phase="additional_exams_finished",
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "status", phase="additional-exams-finished")
-        await _publish_status(session_id, "done", kind="additional-exams")
+        await _publish_status(session_id, "status", phase="additional_exams_finished")
+        await _publish_status(session_id, "done", kind="additional_exams")
         logger.info("Additional exams completed (session=%s)", session_id)
 
     except LLMUserCancelled:
@@ -611,11 +569,10 @@ async def run_additional_exams_task(session_id: str) -> None:
                 session_id, "error",
                 message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
             )
-            # NEW: durable state → error
             await _persist_run_state(
                 session_id, kind,
                 status="error",
-                phase=f"{ek}-runtime-cancel",
+                phase=f"{ek}_runtime_cancel",
                 error_message="Runtime cancelled task",
                 finished_at=firestore.SERVER_TIMESTAMP,
             )
@@ -626,7 +583,6 @@ async def run_additional_exams_task(session_id: str) -> None:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Additional exams failed (session=%s): %s", session_id, e)
 
-        # Fallback stub
         payload = {
             "items": [
                 {
@@ -636,49 +592,45 @@ async def run_additional_exams_task(session_id: str) -> None:
                 }
             ]
         }
-        await _publish_status(session_id, "additional-exams", **payload)
+        await _publish_status(session_id, "additional_exams", **payload)
         await _persist_output(session_id, "additional_exams", payload)
 
-        # NEW: durable state → error
         await _persist_run_state(
             session_id, kind,
             status="error",
-            phase="additional-exams-error",
+            phase="additional_exams_error",
             error_message=str(e),
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
+        await _publish_status(session_id, "done", kind=kind, error=True)
+
 
 @vet_broker.task
 async def run_prescription_task(session_id: str) -> None:
-    """Queueable task: emit medications list for the 'Plan terapéutico / Medicación' UI."""
     kind = "prescription"
-    await _publish_status(session_id, "status", phase="prescription-started")
-
-    # NEW: durable state → running
-    await _persist_run_state(session_id, kind, status="running", phase="prescription-started")
+    await _publish_status(session_id, "status", phase="prescription_started")
+    await _persist_run_state(session_id, kind, status="running", phase="prescription_started")
 
     cancel_event = await _make_cancel_event(session_id, kind)
 
     try:
         payload = await gen_prescription_for_consultation_cancelable(
-            consultation_id=session_id,   # string OK
+            consultation_id=session_id,
             cancel_event=cancel_event,
         )
 
         await _publish_status(session_id, "prescription", **payload)
         await _persist_output(session_id, "prescription", payload)
 
-        # NEW: durable state → done
         await _persist_run_state(
             session_id, kind,
             status="done",
-            phase="prescription-finished",
+            phase="prescription_finished",
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "status", phase="prescription-finished")
+        await _publish_status(session_id, "status", phase="prescription_finished")
         await _publish_status(session_id, "done", kind="prescription")
         logger.info("Prescription completed (session=%s)", session_id)
 
@@ -696,11 +648,10 @@ async def run_prescription_task(session_id: str) -> None:
                 session_id, "error",
                 message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
             )
-            # NEW: durable state → error
             await _persist_run_state(
                 session_id, kind,
                 status="error",
-                phase=f"{ek}-runtime-cancel",
+                phase=f"{ek}_runtime_cancel",
                 error_message="Runtime cancelled task",
                 finished_at=firestore.SERVER_TIMESTAMP,
             )
@@ -711,7 +662,6 @@ async def run_prescription_task(session_id: str) -> None:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Prescription failed (session=%s): %s", session_id, e)
 
-        # Fallback stub
         payload = {
             "items": [
                 {
@@ -730,47 +680,43 @@ async def run_prescription_task(session_id: str) -> None:
         await _publish_status(session_id, "prescription", **payload)
         await _persist_output(session_id, "prescription", payload)
 
-        # NEW: durable state → error
         await _persist_run_state(
             session_id, kind,
             status="error",
-            phase="prescription-error",
+            phase="prescription_error",
             error_message=str(e),
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
+        await _publish_status(session_id, "done", kind=kind, error=True)
+
 
 @vet_broker.task
 async def run_complementary_treatments_task(session_id: str) -> None:
-    """Queueable task: emit complementary treatments list for the UI."""
     kind = "complementary_treatments"
-    await _publish_status(session_id, "status", phase="complementary-treatments-started")
-
-    # NEW: durable state → running
-    await _persist_run_state(session_id, kind, status="running", phase="complementary-treatments-started")
+    await _publish_status(session_id, "status", phase="complementary_treatments_started")
+    await _persist_run_state(session_id, kind, status="running", phase="complementary_treatments_started")
 
     cancel_event = await _make_cancel_event(session_id, kind)
 
     try:
         payload = await gen_complementary_treatments_for_consultation_cancelable(
-            consultation_id=session_id,   # string OK
+            consultation_id=session_id,
             cancel_event=cancel_event,
         )
 
-        await _publish_status(session_id, "complementary-treatments", **payload)
+        await _publish_status(session_id, "complementary_treatments", **payload)
         await _persist_output(session_id, "complementary_treatments", payload)
 
-        # NEW: durable state → done
         await _persist_run_state(
             session_id, kind,
             status="done",
-            phase="complementary-treatments-finished",
+            phase="complementary_treatments_finished",
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "status", phase="complementary-treatments-finished")
-        await _publish_status(session_id, "done", kind="complementary-treatments")
+        await _publish_status(session_id, "status", phase="complementary_treatments_finished")
+        await _publish_status(session_id, "done", kind="complementary_treatments")
         logger.info("Complementary treatments completed (session=%s)", session_id)
 
     except LLMUserCancelled:
@@ -787,11 +733,10 @@ async def run_complementary_treatments_task(session_id: str) -> None:
                 session_id, "error",
                 message=f"Runtime cancelled task (shutting_down={SHUTTING_DOWN})"
             )
-            # NEW: durable state → error
             await _persist_run_state(
                 session_id, kind,
                 status="error",
-                phase=f"{ek}-runtime-cancel",
+                phase=f"{ek}_runtime_cancel",
                 error_message="Runtime cancelled task",
                 finished_at=firestore.SERVER_TIMESTAMP,
             )
@@ -802,7 +747,6 @@ async def run_complementary_treatments_task(session_id: str) -> None:
         await _publish_status(session_id, "error", message=str(e))
         logger.exception("Complementary treatments failed (session=%s): %s", session_id, e)
 
-        # Fallback stub
         payload = {
             "items": [
                 {
@@ -812,16 +756,16 @@ async def run_complementary_treatments_task(session_id: str) -> None:
                 }
             ]
         }
-        await _publish_status(session_id, "complementary-treatments", **payload)
+        await _publish_status(session_id, "complementary_treatments", **payload)
         await _persist_output(session_id, "complementary_treatments", payload)
 
-        # NEW: durable state → error
         await _persist_run_state(
             session_id, kind,
             status="error",
-            phase="complementary-treatments-error",
+            phase="complementary_treatments_error",
             error_message=str(e),
             finished_at=firestore.SERVER_TIMESTAMP,
         )
 
-        await _publish_status(session_id, "done", kind=_hyphen_kind(kind), error=True)
+        await _publish_status(session_id, "done", kind=kind, error=True)
+
