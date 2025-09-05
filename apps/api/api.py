@@ -120,7 +120,8 @@ class VetQueueResponse(BaseModel):
     status: str
     task_id: str
     session_id: str
-    kind: str  # "diagnostics" | "additional_exams" | "prescription" | "complementary_treatments"
+    kind: str
+
 
 #---------------------------------
 # Persistent state models
@@ -517,36 +518,102 @@ async def get_session_view(user_id: int, session_id: str):
 # Vet workflow queueing endpoints (independent from chat flow)
 # ──────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/v1/vet/{session_id}/diagnostics/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+@app.post("/api/v1/vet/{session_id}/diagnostics/queue",
+          response_model=VetQueueResponse,
+          status_code=status.HTTP_202_ACCEPTED)
 async def queue_vet_diagnostics(session_id: str):
     if not run_diagnostics_task:
         raise RuntimeError("Diagnostics worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_diagnostics_task.kiq(session_id=session_id)
-    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="diagnostics")
+
+    # Persist durable run state
+    await _set_vet_run_state(
+        session_id, "diagnostics",
+        status="queued",
+        phase="diagnostics-queued",
+        started_at=firestore.SERVER_TIMESTAMP,
+    )
+
+    return VetQueueResponse(
+    status="queued",
+    task_id=task.task_id,
+    session_id=session_id,
+    kind="diagnostics",
+)
 
 
-@app.post("/api/v1/vet/{session_id}/additional-exams/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+@app.post("/api/v1/vet/{session_id}/additional-exams/queue",
+          response_model=VetQueueResponse,
+          status_code=status.HTTP_202_ACCEPTED)
 async def queue_vet_additional_exams(session_id: str):
     if not run_additional_exams_task:
         raise RuntimeError("Additional-exams worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_additional_exams_task.kiq(session_id=session_id)
-    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="additional_exams")
 
+    # Persist durable run state
+    await _set_vet_run_state(
+        session_id, "additional_exams",
+        status="queued",
+        phase="additional-exams-queued",
+        started_at=firestore.SERVER_TIMESTAMP,
+    )
 
-@app.post("/api/v1/vet/{session_id}/prescription/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+    return VetQueueResponse(
+        status="queued",
+        task_id=task.task_id,
+        session_id=session_id,
+        kind="additional_exams",
+    )
+
+@app.post("/api/v1/vet/{session_id}/prescription/queue",
+          response_model=VetQueueResponse,
+          status_code=status.HTTP_202_ACCEPTED)
 async def queue_vet_prescription(session_id: str):
     if not run_prescription_task:
         raise RuntimeError("Prescription worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_prescription_task.kiq(session_id=session_id)
-    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="prescription")
+
+    # Persist durable run state
+    await _set_vet_run_state(
+        session_id, "prescription",
+        status="queued",
+        phase="prescription-queued",
+        started_at=firestore.SERVER_TIMESTAMP,
+    )
 
 
-@app.post("/api/v1/vet/{session_id}/complementary-treatments/queue", response_model=VetQueueResponse, status_code=status.HTTP_202_ACCEPTED)
+    return VetQueueResponse(
+    status="queued",
+    task_id=task.task_id,
+    session_id=session_id,
+    kind="prescription",
+)
+
+
+@app.post("/api/v1/vet/{session_id}/complementary-treatments/queue",
+          response_model=VetQueueResponse,
+          status_code=status.HTTP_202_ACCEPTED)
 async def queue_vet_complementary(session_id: str):
     if not run_complementary_treatments_task:
         raise RuntimeError("Complementary-treatments worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_complementary_treatments_task.kiq(session_id=session_id)
-    return VetQueueResponse(status="queued", task_id=task.task_id, session_id=session_id, kind="complementary_treatments")
+
+    # Persist durable run state
+    await _set_vet_run_state(
+        session_id, "complementary_treatments",
+        status="queued",
+        phase="complementary-treatments-queued",
+        started_at=firestore.SERVER_TIMESTAMP,
+    )
+
+
+    return VetQueueResponse(
+    status="queued",
+    task_id=task.task_id,
+    session_id=session_id,
+    kind="complementary_treatments",
+)
+
 
 
 
@@ -583,36 +650,90 @@ class VetCancelResponse(BaseModel):
     kind: str
 
 
-
-# --- NEW: cooperative cancel endpoint ---
-@app.post("/api/v1/vet/{session_id}/{kind}/cancel",
+# --- cooperative cancel endpoint (hyphen slugs supported) ---
+@app.post("/api/v1/vet/{session_id}/{kind_slug}/cancel",
           response_model=VetCancelResponse,
           status_code=status.HTTP_202_ACCEPTED)
-async def cancel_vet_step(session_id: str, kind: VetKind):
+async def cancel_vet_step(session_id: str, kind_slug: str):
     """
-    Durable + low-latency cancel:
-      1) SET a sticky cancel key with TTL (so late subscribers still see it)
-      2) PUBLISH a control message (so already-subscribed workers react instantly)
-      3) Optionally nudge UIs on the general channel
+    Accepts hyphenated slugs (e.g. 'additional-exams') just like your queue routes.
+    Internally we convert to underscore keys for Redis/Firestore/worker.
     """
-    control_channel = f"vet:{session_id}:control"
-    flag_key = f"vet:{session_id}:{kind.value}:cancelled"
+    # hyphen → underscore (you already have this helper below; reuse it)
+    kind_key = _norm_kind(kind_slug)  # 'additional-exams' -> 'additional_exams'
 
-    payload = {"event": "cancel", "data": {"kind": kind.value}}
-    # UTC timestamp for debugging; avoid needing timezone import
+    # Optional: update persisted run-state so FE reflects cancel intent immediately
+    cur = await _get_vet_run_state(session_id, kind_key)
+    if (cur.status or "").lower() == "queued":
+        # If it was just queued (not started), mark as cancelled right away
+        await _set_vet_run_state(
+            session_id, kind_key,
+            status="cancelled",
+            phase=f"{kind_slug}-cancelled",
+            finished_at=firestore.SERVER_TIMESTAMP,
+        )
+    else:
+        # Otherwise mark that a cancel was requested; worker will flip to cancelled
+        await _set_vet_run_state(
+            session_id, kind_key,
+            status="cancel_requested",
+            phase=f"{kind_slug}-cancel-requested",
+        )
+
+    # Send durable+ephemeral cancel signal to workers
+    control_channel = f"vet:{session_id}:control"
+    flag_key = f"vet:{session_id}:{kind_key}:cancelled"      # underscore key for sticky bit
+
+    payload = {"event": "cancel", "data": {"kind": kind_key}}  # worker expects underscore key
     stamp = {"ts": datetime.utcnow().isoformat() + "Z"}
 
-    # Order matters: SET (durable) then PUBLISH (ephemeral)
     pipe = redis_stream.pipeline()
-    pipe.set(flag_key, json.dumps(stamp), ex=3600)               # sticky bit with TTL (1h)
-    pipe.publish(control_channel, json.dumps(payload))           # fast notify
+    pipe.set(flag_key, json.dumps(stamp), ex=3600)             # sticky 1h
+    pipe.publish(control_channel, json.dumps(payload))         # instant notify
     await pipe.execute()
 
-    # Optional: UI nudge on the public channel
+    # Optional: nudge UIs on the general channel (hyphen phase for readability)
     await redis_stream.publish(
         f"vet:{session_id}",
-        json.dumps({"event": "status", "data": {"phase": f"{kind.value}-cancel-requested"}})
+        json.dumps({"event": "status", "data": {"phase": f"{kind_slug}-cancel-requested"}})
     )
 
-    return VetCancelResponse(status="cancel-requested", session_id=session_id, kind=kind.value)
+    # Return the same slug the client used (nice symmetry with your queue routes)
+    return VetCancelResponse(status="cancel-requested", session_id=session_id, kind=kind_slug)
 
+
+
+
+
+# ── Helpers for path-kind normalization (accept hyphens in URLs) ──
+def _norm_kind(kind: str) -> str:
+    return str(kind).replace("-", "_")
+
+# ── NEW: aggregate state for a session ──
+@app.get("/api/v1/vet/{session_id}/state", response_model=VetStateResponse)
+async def get_vet_state(session_id: str):
+    """
+    Returns run-state for all vet kinds and a quick 'outputs_updated_at' map.
+    """
+    return await _get_vet_state_aggregate(session_id)
+
+# ── OPTIONAL: per-kind run-state ──
+@app.get("/api/v1/vet/{session_id}/runs/{kind}", response_model=VetRunState)
+async def get_vet_run_state(session_id: str, kind: str):
+    k = _norm_kind(kind)
+    return await _get_vet_run_state(session_id, k)
+
+# ── OPTIONAL: fetch last persisted output for a kind ──
+from pydantic import BaseModel, Field
+
+class VetOutputResponse(BaseModel):
+    kind: str
+    updated_at: Optional[datetime] = None
+    result: Dict[str, Any] = Field(default_factory=dict)
+
+@app.get("/api/v1/vet/{session_id}/outputs/{kind}", response_model=VetOutputResponse)
+async def get_vet_output(session_id: str, kind: str):
+    k = _norm_kind(kind)
+    snap = await _vet_output_ref(session_id, k).get()
+    d = snap.to_dict() or {}
+    return VetOutputResponse(kind=k, updated_at=d.get("updated_at"), result=d.get("result") or {})
