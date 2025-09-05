@@ -513,21 +513,37 @@ class VetCancelResponse(BaseModel):
     session_id: str
     kind: str
 
+
+
 # --- NEW: cooperative cancel endpoint ---
 @app.post("/api/v1/vet/{session_id}/{kind}/cancel",
           response_model=VetCancelResponse,
           status_code=status.HTTP_202_ACCEPTED)
 async def cancel_vet_step(session_id: str, kind: VetKind):
-    # 1) publish a control message the running worker is subscribed to
+    """
+    Durable + low-latency cancel:
+      1) SET a sticky cancel key with TTL (so late subscribers still see it)
+      2) PUBLISH a control message (so already-subscribed workers react instantly)
+      3) Optionally nudge UIs on the general channel
+    """
     control_channel = f"vet:{session_id}:control"
-    await redis_stream.publish(
-        control_channel,
-        json.dumps({"event": "cancel", "data": {"kind": kind.value}})
-    )
+    flag_key = f"vet:{session_id}:{kind.value}:cancelled"
 
-    # 2) optional: nudge UIs immediately on the general channel
+    payload = {"event": "cancel", "data": {"kind": kind.value}}
+    # UTC timestamp for debugging; avoid needing timezone import
+    stamp = {"ts": datetime.utcnow().isoformat() + "Z"}
+
+    # Order matters: SET (durable) then PUBLISH (ephemeral)
+    pipe = redis_stream.pipeline()
+    pipe.set(flag_key, json.dumps(stamp), ex=3600)               # sticky bit with TTL (1h)
+    pipe.publish(control_channel, json.dumps(payload))           # fast notify
+    await pipe.execute()
+
+    # Optional: UI nudge on the public channel
     await redis_stream.publish(
         f"vet:{session_id}",
         json.dumps({"event": "status", "data": {"phase": f"{kind.value}-cancel-requested"}})
     )
+
     return VetCancelResponse(status="cancel-requested", session_id=session_id, kind=kind.value)
+
