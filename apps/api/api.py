@@ -1,4 +1,4 @@
-# api.py — Single-continuum API
+# api_underscores.py — Copy of API with underscore-standardized kinds
 
 import os
 from uuid import uuid4
@@ -530,31 +530,31 @@ async def queue_vet_diagnostics(session_id: str):
     await _set_vet_run_state(
         session_id, "diagnostics",
         status="queued",
-        phase="diagnostics-queued",
+        phase="diagnostics_queued",
         started_at=firestore.SERVER_TIMESTAMP,
     )
 
     return VetQueueResponse(
-    status="queued",
-    task_id=task.task_id,
-    session_id=session_id,
-    kind="diagnostics",
-)
+        status="queued",
+        task_id=task.task_id,
+        session_id=session_id,
+        kind="diagnostics",
+    )
 
 
-@app.post("/api/v1/vet/{session_id}/additional-exams/queue",
+@app.post("/api/v1/vet/{session_id}/additional_exams/queue",
           response_model=VetQueueResponse,
           status_code=status.HTTP_202_ACCEPTED)
 async def queue_vet_additional_exams(session_id: str):
     if not run_additional_exams_task:
-        raise RuntimeError("Additional-exams worker not available. Did you deploy tasks/vet_tasks.py?")
+        raise RuntimeError("Additional_exams worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_additional_exams_task.kiq(session_id=session_id)
 
     # Persist durable run state
     await _set_vet_run_state(
         session_id, "additional_exams",
         status="queued",
-        phase="additional-exams-queued",
+        phase="additional_exams_queued",
         started_at=firestore.SERVER_TIMESTAMP,
     )
 
@@ -577,42 +577,42 @@ async def queue_vet_prescription(session_id: str):
     await _set_vet_run_state(
         session_id, "prescription",
         status="queued",
-        phase="prescription-queued",
+        phase="prescription_queued",
         started_at=firestore.SERVER_TIMESTAMP,
     )
 
 
     return VetQueueResponse(
-    status="queued",
-    task_id=task.task_id,
-    session_id=session_id,
-    kind="prescription",
-)
+        status="queued",
+        task_id=task.task_id,
+        session_id=session_id,
+        kind="prescription",
+    )
 
 
-@app.post("/api/v1/vet/{session_id}/complementary-treatments/queue",
+@app.post("/api/v1/vet/{session_id}/complementary_treatments/queue",
           response_model=VetQueueResponse,
           status_code=status.HTTP_202_ACCEPTED)
 async def queue_vet_complementary(session_id: str):
     if not run_complementary_treatments_task:
-        raise RuntimeError("Complementary-treatments worker not available. Did you deploy tasks/vet_tasks.py?")
+        raise RuntimeError("Complementary_treatments worker not available. Did you deploy tasks/vet_tasks.py?")
     task = await run_complementary_treatments_task.kiq(session_id=session_id)
 
     # Persist durable run state
     await _set_vet_run_state(
         session_id, "complementary_treatments",
         status="queued",
-        phase="complementary-treatments-queued",
+        phase="complementary_treatments_queued",
         started_at=firestore.SERVER_TIMESTAMP,
     )
 
 
     return VetQueueResponse(
-    status="queued",
-    task_id=task.task_id,
-    session_id=session_id,
-    kind="complementary_treatments",
-)
+        status="queued",
+        task_id=task.task_id,
+        session_id=session_id,
+        kind="complementary_treatments",
+    )
 
 
 
@@ -650,17 +650,17 @@ class VetCancelResponse(BaseModel):
     kind: str
 
 
-# --- cooperative cancel endpoint (hyphen slugs supported) ---
-@app.post("/api/v1/vet/{session_id}/{kind_slug}/cancel",
+# --- cooperative cancel endpoint (underscored kinds; hyphens normalized) ---
+@app.post("/api/v1/vet/{session_id}/{kind}/cancel",
           response_model=VetCancelResponse,
           status_code=status.HTTP_202_ACCEPTED)
-async def cancel_vet_step(session_id: str, kind_slug: str):
+async def cancel_vet_step(session_id: str, kind: str):
     """
-    Accepts hyphenated slugs (e.g. 'additional-exams') just like your queue routes.
-    Internally we convert to underscore keys for Redis/Firestore/worker.
+    Accepts kind keys using underscores (preferred). If a hyphenated slug is
+    provided, it is normalized to underscores internally and in responses.
     """
-    # hyphen → underscore (you already have this helper below; reuse it)
-    kind_key = _norm_kind(kind_slug)  # 'additional-exams' -> 'additional_exams'
+    # hyphen → underscore normalization (idempotent for underscore input)
+    kind_key = _norm_kind(kind)
 
     # Optional: update persisted run-state so FE reflects cancel intent immediately
     cur = await _get_vet_run_state(session_id, kind_key)
@@ -669,7 +669,7 @@ async def cancel_vet_step(session_id: str, kind_slug: str):
         await _set_vet_run_state(
             session_id, kind_key,
             status="cancelled",
-            phase=f"{kind_slug}-cancelled",
+            phase=f"{kind_key}_cancelled",
             finished_at=firestore.SERVER_TIMESTAMP,
         )
     else:
@@ -677,7 +677,7 @@ async def cancel_vet_step(session_id: str, kind_slug: str):
         await _set_vet_run_state(
             session_id, kind_key,
             status="cancel_requested",
-            phase=f"{kind_slug}-cancel-requested",
+            phase=f"{kind_key}_cancel_requested",
         )
 
     # Send durable+ephemeral cancel signal to workers
@@ -692,15 +692,14 @@ async def cancel_vet_step(session_id: str, kind_slug: str):
     pipe.publish(control_channel, json.dumps(payload))         # instant notify
     await pipe.execute()
 
-    # Optional: nudge UIs on the general channel (hyphen phase for readability)
+    # Optional: nudge UIs on the general channel (underscore phase for consistency)
     await redis_stream.publish(
         f"vet:{session_id}",
-        json.dumps({"event": "status", "data": {"phase": f"{kind_slug}-cancel-requested"}})
+        json.dumps({"event": "status", "data": {"phase": f"{kind_key}_cancel_requested"}})
     )
 
-    # Return the same slug the client used (nice symmetry with your queue routes)
-    return VetCancelResponse(status="cancel-requested", session_id=session_id, kind=kind_slug)
-
+    # Return the normalized kind key (underscore)
+    return VetCancelResponse(status="cancel_requested", session_id=session_id, kind=kind_key)
 
 
 
@@ -737,3 +736,4 @@ async def get_vet_output(session_id: str, kind: str):
     snap = await _vet_output_ref(session_id, k).get()
     d = snap.to_dict() or {}
     return VetOutputResponse(kind=k, updated_at=d.get("updated_at"), result=d.get("result") or {})
+
