@@ -134,7 +134,9 @@ jobs:
           CHAT_UPLOAD_BUCKET=${{ vars.CHAT_UPLOAD_BUCKET }},\
           AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},\
           GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
-          DATABASE_URL=${{ secrets.DATABASE_URL }}"
+          DATABASE_URL=${{ secrets.DATABASE_URL }},\
+          PG_DSN=${{secrets.PG_DSN}}"
+          
 
           # Inject the OpenAI key only for vet_worker
           if [ "$APP_SLUG" = "vet_worker" ]; then
