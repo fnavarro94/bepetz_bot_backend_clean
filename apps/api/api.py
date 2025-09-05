@@ -122,6 +122,26 @@ class VetQueueResponse(BaseModel):
     session_id: str
     kind: str  # "diagnostics" | "additional_exams" | "prescription" | "complementary_treatments"
 
+#---------------------------------
+# Persistent state models
+#---------------------------------
+
+# ── NEW: Vet run-state models ─────────────────────────────────────────
+from typing import Optional, Dict
+
+class VetRunState(BaseModel):
+    status: str = "idle"                 # idle|queued|running|cancel_requested|done|error|cancelled
+    phase: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class VetStateResponse(BaseModel):
+    session_id: str
+    runs: Dict[str, VetRunState]         # by kind
+    # last persisted output "updated_at" per kind (quick FE hint)
+    outputs_updated_at: Dict[str, Optional[datetime]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,6 +245,55 @@ def _generate_put_signed_url(blob, content_type: str, minutes: int = 15) -> str:
         service_account_email=sa_email,
         access_token=creds.token,
     )
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistent state helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── NEW: Firestore refs & helpers for vet run states ─────────────────
+_VET_KINDS = ["diagnostics", "additional_exams", "prescription", "complementary_treatments"]
+
+def _vet_run_ref(session_id: str, kind: str):
+    return (db.collection("vet_sessions")
+             .document(session_id)
+             .collection("runs")
+             .document(kind))
+
+def _vet_output_ref(session_id: str, kind: str):
+    return (db.collection("vet_sessions")
+             .document(session_id)
+             .collection("outputs")
+             .document(kind))
+
+async def _set_vet_run_state(session_id: str, kind: str, **fields):
+    """Merge-write run state; always bump updated_at."""
+    payload = {**fields, "updated_at": firestore.SERVER_TIMESTAMP}
+    await _vet_run_ref(session_id, kind).set(payload, merge=True)
+
+async def _get_vet_run_state(session_id: str, kind: str) -> VetRunState:
+    snap = await _vet_run_ref(session_id, kind).get()
+    d = snap.to_dict() or {}
+    # default to "idle" if nothing written yet
+    return VetRunState(**({"status": "idle"} | d))
+
+async def _get_vet_state_aggregate(session_id: str) -> VetStateResponse:
+    runs: Dict[str, VetRunState] = {}
+    outputs_updated_at: Dict[str, Optional[datetime]] = {}
+
+    for k in _VET_KINDS:
+        # run-state
+        r = await _get_vet_run_state(session_id, k)
+        runs[k] = r
+
+        # output updated_at (helpful to know if UI can show last result)
+        osnap = await _vet_output_ref(session_id, k).get()
+        od = osnap.to_dict() or {}
+        outputs_updated_at[k] = od.get("updated_at")
+
+    return VetStateResponse(session_id=session_id, runs=runs, outputs_updated_at=outputs_updated_at)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
