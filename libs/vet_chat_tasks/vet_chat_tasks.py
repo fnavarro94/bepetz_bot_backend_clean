@@ -437,6 +437,7 @@ async def process_vet_chat_message_task(
         assistant_text_chunks: list[str] = []
 
         # 5) Stream using Responses API (helper always uses Responses)
+        # 5) Stream using Responses API (helper always uses Responses)
         async def _publish_loop():
             nonlocal delta_count, last_log_t, was_cancelled
             for chunk in helper.stream_text(
@@ -448,10 +449,15 @@ async def process_vet_chat_message_task(
                 metadata={"consultation_id": consultation_id, "app_id": app_id, "turn_id": turn_id},
                 store=True,                           # keep retrievable by response.id
             ):
-                # Cooperative cancel: check at chunk boundaries
+                # ── Cooperative cancel: stop both locally and on OpenAI's side ──
                 if cancel_event.is_set():
                     was_cancelled = True
-                    raise UserCancelled()
+                    try:
+                        # Best-effort: explicitly cancel the in-flight Responses job
+                        helper.cancel_current()
+                    finally:
+                        # Exit the streaming loop; outer handler will mark 'cancelled'
+                        raise UserCancelled()
 
                 if not chunk:
                     continue

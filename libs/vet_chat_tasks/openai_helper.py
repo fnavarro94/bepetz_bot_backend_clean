@@ -6,18 +6,6 @@ from typing import Generator, Iterable, Optional, Dict, Any
 
 from openai import OpenAI, Stream  # Stream is for typing of the streaming context
 
-"""
-Env vars
-
-OPENAI_API_KEY           – required
-OPENAI_BASE_URL          – optional (self-hosted proxy etc.)
-OPENAI_ORG_ID            – optional
-OPENAI_MODEL             – model name, e.g. "gpt-4o-mini", "gpt-4o", "gpt-5.1-mini"
-OPENAI_REASONING_EFFORT  – for GPT-5 only ("low" | "medium" | "high"), default "medium"
-OPENAI_TEMPERATURE       – default 0.7
-OPENAI_MAX_OUTPUT_TOKENS – for Responses API (all models)
-"""
-
 def _is_gpt5(model: str) -> bool:
     return str(model or "").lower().startswith("gpt-5")
 
@@ -31,31 +19,13 @@ def _float_from_env(name: str, default: float) -> float:
 class OpenAIChatHelper:
     """
     Unified streaming helper using the Responses API for ALL models.
-
-    - Uses Responses API with streaming (`responses.stream`).
-    - Sends `instructions` (system/developer message), `input` (user text).
-    - Optionally chains context via `previous_response_id`.
-    - Captures `last_response_id` after streaming to enable continuity.
-    - Only sends the `reasoning` param for GPT-5.* models.
-
-    Usage:
-        helper = OpenAIChatHelper()
-        for chunk in helper.stream_text(
-            user_text="Hello there",
-            system_prompt="You are helpful.",
-            previous_response_id="<prior-response-id-if-any>",
-            metadata={"consultation_id": "abc123"},
-            store=True,
-        ):
-            publish(chunk)  # e.g., to Redis/relay
-
-        # After the stream finishes:
-        last_id = helper.last_response_id
+    Now supports server-side cancellation via responses.cancel(response_id).
     """
 
     def __init__(self, model: Optional[str] = None):
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.last_response_id: Optional[str] = None
+        self.current_response_id: Optional[str] = None  # <── NEW
 
         self.client = OpenAI(
             api_key=os.environ.get("OPENAI_API_KEY"),
@@ -63,7 +33,6 @@ class OpenAIChatHelper:
             organization=os.environ.get("OPENAI_ORG_ID") or None,
         )
 
-        # Defaults
         self.default_temperature = _float_from_env("OPENAI_TEMPERATURE", 0.7)
         self.default_reasoning = os.getenv("OPENAI_REASONING_EFFORT", "medium")
         self.default_max_tokens = os.getenv("OPENAI_MAX_OUTPUT_TOKENS")
@@ -80,7 +49,7 @@ class OpenAIChatHelper:
         self,
         *,
         user_text: str,
-        system_prompt: Optional[str] = None,   # sent as 'instructions'
+        system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,  # only for GPT-5.*
@@ -88,9 +57,6 @@ class OpenAIChatHelper:
         metadata: Optional[Dict[str, Any]] = None,
         store: bool = True,
     ) -> Generator[str, None, None]:
-        """
-        Stream text deltas (strings) as they arrive from the Responses API.
-        """
         model = self.model
         temperature = self._coalesce_float(temperature, self.default_temperature)
         max_output_tokens = max_output_tokens if max_output_tokens is not None else self.default_max_tokens
@@ -108,11 +74,24 @@ class OpenAIChatHelper:
         )
 
     def retrieve_response(self, response_id: str):
-        """
-        Retrieve a previously stored response by ID.
-        Note: You must have called with store=True when creating it.
-        """
         return self.client.responses.retrieve(response_id)
+
+    # NEW: best-effort server-side cancel
+    def cancel_current(self) -> bool:
+        """
+        Attempts to cancel the currently-streaming response on OpenAI's side.
+        Returns True if a cancel call was issued; False otherwise.
+        """
+        rid = self.current_response_id
+        if not rid:
+            return False
+        try:
+            # OpenAI Responses API supports cancellation of an in-flight response id
+            self.client.responses.cancel(rid)
+            return True
+        except Exception:
+            # Even if this fails, closing the stream (context exit) already stops generation.
+            return False
 
     # ─────────────────────────────────────────────────────────────────────
     # Internals
@@ -130,14 +109,6 @@ class OpenAIChatHelper:
         metadata: Optional[Dict[str, Any]],
         store: bool,
     ) -> Iterable[str]:
-        """
-        Responses API with streaming.
-        - `instructions`: system/developer guidance
-        - `input`: user text
-        - `previous_response_id`: chains the conversation
-        - `store`: persist server-side so you can retrieve by ID later
-        - `metadata`: arbitrary dict echoed back in retrieval/list contexts
-        """
         kwargs: Dict[str, Any] = {
             "model": model,
             "input": user_text,
@@ -156,28 +127,43 @@ class OpenAIChatHelper:
         if metadata:
             kwargs["metadata"] = metadata
 
-        # Stream and yield deltas
+        self.current_response_id = None  # reset before starting a new stream
         with self.client.responses.stream(**kwargs) as stream:  # type: Stream
             for event in stream:
-                # We care about:
-                #  - "response.output_text.delta": incremental text
-                #  - "response.error": raise
                 et = getattr(event, "type", None)
-                if et == "response.output_text.delta":
+
+                # Capture the response id as early as possible
+                if et == "response.created":
+                    # Some SDK builds expose event.response.id; fall back to event.id if present.
+                    rid = None
+                    try:
+                        rid = getattr(getattr(event, "response", None), "id", None)
+                    except Exception:
+                        pass
+                    rid = rid or getattr(event, "id", None)
+                    if rid:
+                        self.current_response_id = rid
+
+                elif et == "response.output_text.delta":
                     delta = getattr(event, "delta", None)
                     if delta:
                         yield delta
+
                 elif et == "response.error":
                     msg = getattr(event, "error", None)
                     raise RuntimeError(f"OpenAI stream error: {msg}")
-                # Optional: handle other events if you add tools, etc.
 
-            # Ensure the stream finishes and capture the response id
+                # (You can handle tool events here if you add them later.)
+
+            # Finish & capture final id; clear current stream id
             final = stream.get_final_response()
             try:
                 self.last_response_id = getattr(final, "id", None)
             except Exception:
                 self.last_response_id = None
+
+        # We're out of the context: no longer streaming
+        self.current_response_id = None
 
     @staticmethod
     def _coalesce_float(value: Optional[float], default: float) -> float:
