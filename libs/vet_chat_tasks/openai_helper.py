@@ -2,20 +2,20 @@
 from __future__ import annotations
 
 import os
-from typing import Generator, Iterable, Optional
+from typing import Generator, Iterable, Optional, Dict, Any
 
-from openai import OpenAI, Stream
+from openai import OpenAI, Stream  # Stream is for typing of the streaming context
 
 """
 Env vars
 
-OPENAI_API_KEY        – required
-OPENAI_BASE_URL       – optional (self-hosted proxy etc.)
-OPENAI_ORG_ID         – optional
-OPENAI_MODEL          – model name, e.g. "gpt-5.1-mini" or "gpt-4o-mini"
-OPENAI_REASONING_EFFORT – for GPT-5 only ("low" | "medium" | "high"), default "medium"
-OPENAI_TEMPERATURE    – default 0.7
-OPENAI_MAX_OUTPUT_TOKENS – for GPT-5 (Responses) or GPT-4 (Chat) appropriately
+OPENAI_API_KEY           – required
+OPENAI_BASE_URL          – optional (self-hosted proxy etc.)
+OPENAI_ORG_ID            – optional
+OPENAI_MODEL             – model name, e.g. "gpt-4o-mini", "gpt-4o", "gpt-5.1-mini"
+OPENAI_REASONING_EFFORT  – for GPT-5 only ("low" | "medium" | "high"), default "medium"
+OPENAI_TEMPERATURE       – default 0.7
+OPENAI_MAX_OUTPUT_TOKENS – for Responses API (all models)
 """
 
 def _is_gpt5(model: str) -> bool:
@@ -27,21 +27,36 @@ def _float_from_env(name: str, default: float) -> float:
     except Exception:
         return default
 
+
 class OpenAIChatHelper:
     """
-    Unified streaming helper:
+    Unified streaming helper using the Responses API for ALL models.
 
-    - For GPT-5.* → Responses API with streaming, supports `reasoning`
-    - For GPT-4/4o* → Chat Completions API with streaming
+    - Uses Responses API with streaming (`responses.stream`).
+    - Sends `instructions` (system/developer message), `input` (user text).
+    - Optionally chains context via `previous_response_id`.
+    - Captures `last_response_id` after streaming to enable continuity.
+    - Only sends the `reasoning` param for GPT-5.* models.
 
     Usage:
         helper = OpenAIChatHelper()
-        for chunk in helper.stream_text(user_text="Hello", system_prompt="You are helpful"):
+        for chunk in helper.stream_text(
+            user_text="Hello there",
+            system_prompt="You are helpful.",
+            previous_response_id="<prior-response-id-if-any>",
+            metadata={"consultation_id": "abc123"},
+            store=True,
+        ):
             publish(chunk)  # e.g., to Redis/relay
+
+        # After the stream finishes:
+        last_id = helper.last_response_id
     """
 
     def __init__(self, model: Optional[str] = None):
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.last_response_id: Optional[str] = None
+
         self.client = OpenAI(
             api_key=os.environ.get("OPENAI_API_KEY"),
             base_url=os.environ.get("OPENAI_BASE_URL") or None,
@@ -65,35 +80,39 @@ class OpenAIChatHelper:
         self,
         *,
         user_text: str,
-        system_prompt: Optional[str] = None,
+        system_prompt: Optional[str] = None,   # sent as 'instructions'
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,  # only for GPT-5.*
+        previous_response_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        store: bool = True,
     ) -> Generator[str, None, None]:
         """
-        Yields text deltas as they arrive.
+        Stream text deltas (strings) as they arrive from the Responses API.
         """
         model = self.model
         temperature = self._coalesce_float(temperature, self.default_temperature)
         max_output_tokens = max_output_tokens if max_output_tokens is not None else self.default_max_tokens
 
-        if _is_gpt5(model):
-            yield from self._stream_with_responses_api(
-                model=model,
-                user_text=user_text,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                reasoning_effort=reasoning_effort or self.default_reasoning,
-            )
-        else:
-            yield from self._stream_with_chat_completions(
-                model=model,
-                user_text=user_text,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                max_tokens=max_output_tokens,  # chat-completions uses "max_tokens"
-            )
+        yield from self._stream_with_responses_api(
+            model=model,
+            user_text=user_text,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=(reasoning_effort or self.default_reasoning) if _is_gpt5(model) else None,
+            previous_response_id=previous_response_id,
+            metadata=metadata,
+            store=store,
+        )
+
+    def retrieve_response(self, response_id: str):
+        """
+        Retrieve a previously stored response by ID.
+        Note: You must have called with store=True when creating it.
+        """
+        return self.client.responses.retrieve(response_id)
 
     # ─────────────────────────────────────────────────────────────────────
     # Internals
@@ -107,30 +126,42 @@ class OpenAIChatHelper:
         temperature: Optional[float],
         max_output_tokens: Optional[int],
         reasoning_effort: Optional[str],
+        previous_response_id: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        store: bool,
     ) -> Iterable[str]:
         """
-        GPT-5: Responses API (supports `reasoning`).
-        - We pass `input` as a plain string and optional `system`.
+        Responses API with streaming.
+        - `instructions`: system/developer guidance
+        - `input`: user text
+        - `previous_response_id`: chains the conversation
+        - `store`: persist server-side so you can retrieve by ID later
+        - `metadata`: arbitrary dict echoed back in retrieval/list contexts
         """
-        kwargs = {
+        kwargs: Dict[str, Any] = {
             "model": model,
             "input": user_text,
+            "store": bool(store),
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["instructions"] = system_prompt
         if temperature is not None:
             kwargs["temperature"] = temperature
         if max_output_tokens is not None:
             kwargs["max_output_tokens"] = int(max_output_tokens)
         if reasoning_effort:
             kwargs["reasoning"] = {"effort": reasoning_effort}
+        if previous_response_id:
+            kwargs["previous_response_id"] = previous_response_id
+        if metadata:
+            kwargs["metadata"] = metadata
 
         # Stream and yield deltas
         with self.client.responses.stream(**kwargs) as stream:  # type: Stream
             for event in stream:
-                # The event types we care about for text deltas:
-                #  - "response.output_text.delta" (preferred)
-                #  - "response.error" (raise)
+                # We care about:
+                #  - "response.output_text.delta": incremental text
+                #  - "response.error": raise
                 et = getattr(event, "type", None)
                 if et == "response.output_text.delta":
                     delta = getattr(event, "delta", None)
@@ -139,46 +170,14 @@ class OpenAIChatHelper:
                 elif et == "response.error":
                     msg = getattr(event, "error", None)
                     raise RuntimeError(f"OpenAI stream error: {msg}")
-                # You could also watch "response.completed" if you need to hook EOS.
-            # Ensure the stream finishes cleanly (raises if server aborted)
-            _ = stream.get_final_response()
+                # Optional: handle other events if you add tools, etc.
 
-    def _stream_with_chat_completions(
-        self,
-        *,
-        model: str,
-        user_text: str,
-        system_prompt: Optional[str],
-        temperature: Optional[float],
-        max_tokens: Optional[int],
-    ) -> Iterable[str]:
-        """
-        GPT-4/4o: Chat Completions API (no `reasoning` field).
-        """
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_text})
-
-        kwargs = {
-            "model": model,
-            "messages": messages,
-            "stream": True,
-        }
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        if max_tokens is not None:
-            kwargs["max_tokens"] = int(max_tokens)
-
-        stream = self.client.chat.completions.create(**kwargs)
-        for chunk in stream:
+            # Ensure the stream finishes and capture the response id
+            final = stream.get_final_response()
             try:
-                part = chunk.choices[0].delta
-                if part and part.content:
-                    yield part.content
+                self.last_response_id = getattr(final, "id", None)
             except Exception:
-                # Defensive: some chunks may be control frames
-                continue
+                self.last_response_id = None
 
     @staticmethod
     def _coalesce_float(value: Optional[float], default: float) -> float:
