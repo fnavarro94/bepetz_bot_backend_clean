@@ -341,7 +341,7 @@ async def process_message_task(
         user_message_id=user_msg_id,     # you’ll use this same id when you persist the message
     )
 
-    await asyncio.sleep(5)
+    
 
     await user_msg_doc.set({
         "timestamp": firestore.SERVER_TIMESTAMP,
