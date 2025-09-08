@@ -15,6 +15,7 @@ RUN apt-get update && \
 COPY libs/common /opt/libs/common
 COPY libs/tasks  /opt/libs/tasks
 COPY libs/vet_tasks /opt/libs/vet_tasks
+COPY libs/vet_chat_tasks /opt/libs/vet_chat_tasks
 
 ENV PYTHONPATH="/opt/libs:${PYTHONPATH}"
 

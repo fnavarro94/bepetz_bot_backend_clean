@@ -48,7 +48,7 @@ services:
       - "8081:8080"   # health endpoint
     restart: unless-stopped
 
-  # NEW: Vet workflow worker (TaskIQ) ----------------------------------
+  # NEW: Vet workflow worker (TaskIQ)
   vet_worker:
     build:
       context: .
@@ -62,16 +62,39 @@ services:
       STREAM_REDIS_PORT: "6379"
       STREAM_REDIS_SSL: "false"
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
-      # Optional: inject your dummy session inputs here (JSON map of session_id -> object)
-      # VET_DUMMY_SESSIONS_JSON: |
-      #   {"sess-gi": {"patient":{"species":"canine","breed":"Beagle","age":5,"sex":"F","weight_kg":11.4},
-      #                "complaints":["Vomiting","Diarrhea"], "vitals":{"temp_c":39.7}}}
     volumes:
       - ./service_account.json:/secrets/service_account.json:ro
     depends_on:
       - redis
     ports:
       - "8082:8080"   # health endpoint
+    restart: unless-stopped
+
+  # NEW: Vet-chat worker (TaskIQ + OpenAI Responses)
+  vet_chat_worker:
+    build:
+      context: .
+      dockerfile: apps/vet_chat_worker/Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0                # TaskIQ broker URL
+      STREAM_REDIS_HOST: redis                       # for streaming deltas to relay
+      STREAM_REDIS_PORT: "6379"
+      STREAM_REDIS_SSL: "false"
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
+      # Optional GPT-5 settings (or put them in .env)
+      # VET_CHAT_MODEL: gpt-5
+      # VET_CHAT_INSTRUCTIONS: "You are a helpful veterinary assistant."
+      # VET_CHAT_VERBOSITY: medium
+      # VET_CHAT_REASONING_EFFORT: low
+      # VET_CHAT_MAX_OUTPUT_TOKENS: "800"
+      # OPENAI_BASE_URL: "https://api.openai.com/v1"  # only if using a proxy/gateway
+    volumes:
+      - ./service_account.json:/secrets/service_account.json:ro
+    depends_on:
+      - redis
+    ports:
+      - "8083:8080"   # health endpoint
     restart: unless-stopped
 
   relay:

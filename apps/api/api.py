@@ -30,6 +30,7 @@ import asyncio
 from google.cloud.firestore_v1 import FieldFilter  # for equality filters
 
 # ── New: Vet workflow tasks (Diagnostics / Exams / Prescription / Complementary) ──
+from vet_chat_tasks.vet_chat_tasks import process_vet_chat_message_task
 try:
     # when the new worker file is added (below), these imports will resolve
     from vet_tasks.vet_tasks import (
@@ -737,3 +738,288 @@ async def get_vet_output(session_id: str, kind: str):
     d = snap.to_dict() or {}
     return VetOutputResponse(kind=k, updated_at=d.get("updated_at"), result=d.get("result") or {})
 
+
+
+
+#--------------------------------------------------
+# Vet Chat Components
+#--------------------------------------------------
+
+class VetChatMessageRequest(BaseModel):
+    message: str
+    attachments: List[AttachmentMeta] = Field(default_factory=list)
+
+class VetChatQueueResponse(BaseModel):
+    status: str
+    task_id: str
+    consultation_id: str
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet-chat message endpoint (simple: consultation_id + message)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.post(
+    "/api/v1/vet_chat/{consultation_id}/message",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=VetChatQueueResponse,
+)
+async def queue_vet_chat_message(consultation_id: str, req: VetChatMessageRequest):
+    """
+    Minimal vet-chat flow:
+    - Accepts consultation_id and a message (+ optional attachments).
+    - Queues a worker job that:
+        * looks up/creates the OpenAI session for this consultation,
+        * sends the message,
+        * streams tokens to your FE (implementation detail in vet_chat_tasks),
+        * persists mapping consultation_id → openai_session_id for reuse.
+    """
+    if not process_vet_chat_message_task:
+        raise RuntimeError("Vet-chat worker not available. Did you deploy vet_chat_tasks/vet_chat_tasks.py?")
+
+    task = await process_vet_chat_message_task.kiq(
+        consultation_id=consultation_id,
+        message=req.message,
+        attachments=[a.dict() for a in req.attachments],
+    )
+
+    return VetChatQueueResponse(
+        status="queued",
+        task_id=task.task_id,
+        consultation_id=consultation_id,
+    )
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet Chat – history response models (place near your other Pydantic models)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class VetChatHistoryMessage(BaseModel):
+    id: str
+    created_at: Optional[datetime] = None
+    role: str
+    content: str
+    attachments: List[AttachmentMeta] = Field(default_factory=list)
+    # Optional metadata your worker stores on assistant turns
+    model: Optional[str] = None
+    app_id: Optional[str] = None
+    previous_response_id: Optional[str] = None
+    response_id: Optional[str] = None
+    complete: Optional[bool] = None
+    chunks: Optional[int] = None
+    system_instructions: Optional[str] = None
+    reply_to: Optional[str] = None
+
+class VetChatHistoryResponse(BaseModel):
+    consultation_id: str
+    last_response_id: Optional[str] = None
+    app_id: Optional[str] = None
+    app: Optional[Dict[str, Any]] = None
+    messages: List[VetChatHistoryMessage] = Field(default_factory=list)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet Chat – turn state model
+# ──────────────────────────────────────────────────────────────────────────────
+class VetChatTurnStateResponse(BaseModel):
+    consultation_id: str
+    turn_id: Optional[str] = None
+    turn_status: Optional[str] = None            # "started" | "error" | "done"
+    turn_started_at: Optional[datetime] = None
+    turn_completed_at: Optional[datetime] = None
+    turn_updated_at: Optional[datetime] = None
+    turn_error_message: Optional[str] = None
+    turn_user_message_id: Optional[str] = None
+    turn_assistant_message_id: Optional[str] = None
+    turn_last_response_id: Optional[str] = None
+    turn_model: Optional[str] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet Chat – fetch historical conversation (hard-coded collection name)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get(
+    "/api/v1/vet_chat/{consultation_id}/history",
+    response_model=VetChatHistoryResponse
+)
+async def get_vet_chat_history(
+    consultation_id: str,
+    limit: int = 250,
+    after: Optional[datetime] = None,   # return messages strictly after this timestamp
+    order: str = "asc",                 # "asc" (default) or "desc" by created_at
+):
+    """
+    Retrieve the persisted conversation for a vet consultation:
+      - Reads from: vet_chat_consultations/{consultation_id}/messages
+      - Orders by 'created_at' (asc by default).
+      - Supports 'after' cursor (timestamp) and 'limit' for pagination.
+      - Also returns the consultation doc's last_response_id and app metadata.
+    """
+    # Clamp limit (defensive)
+    limit = max(1, min(limit, 1000))
+
+    # Consultation doc (holds app + chain anchor)
+    consult_ref = db.collection("vet_chat_consultations").document(consultation_id)
+    consult_snap = await consult_ref.get()
+
+    if not consult_snap.exists:
+        # Conversation hasn't started yet
+        return VetChatHistoryResponse(
+            consultation_id=consultation_id,
+            last_response_id=None,
+            app_id=None,
+            app=None,
+            messages=[],
+        )
+
+    consult_doc = consult_snap.to_dict() or {}
+    app_id = consult_doc.get("openai_app_id")
+    app = consult_doc.get("openai_app")
+    last_response_id = consult_doc.get("openai_last_response_id")
+
+    # Build the query against the messages subcollection
+    mref = consult_ref.collection("messages")
+
+    # Order direction
+    direction = firestore.Query.ASCENDING
+    if str(order).lower() == "desc":
+        direction = firestore.Query.DESCENDING
+
+    q = mref.order_by("created_at", direction=direction)
+
+    # Optional 'after' cursor (strictly greater than the provided timestamp)
+    if after:
+        q = q.where(filter=FieldFilter("created_at", ">", after))
+
+    q = q.limit(limit)
+
+    docs = [d async for d in q.stream()]
+
+    # Map Firestore docs to response model
+    out_msgs: List[VetChatHistoryMessage] = []
+    for d in docs:
+        m = d.to_dict() or {}
+        out_msgs.append(
+            VetChatHistoryMessage(
+                id=d.id,
+                created_at=m.get("created_at"),
+                role=m.get("role", "assistant"),
+                content=m.get("content", ""),
+                attachments=m.get("attachments") or [],
+                model=m.get("model"),
+                app_id=m.get("app_id"),
+                previous_response_id=m.get("previous_response_id"),
+                response_id=m.get("response_id"),
+                complete=m.get("complete"),
+                chunks=m.get("chunks"),
+                system_instructions=m.get("system_instructions"),
+                reply_to=m.get("reply_to"),
+            )
+        )
+
+    return VetChatHistoryResponse(
+        consultation_id=consultation_id,
+        last_response_id=last_response_id,
+        app_id=app_id,
+        app=app,
+        messages=out_msgs,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vet Chat – fetch current turn state (hard-coded collection name)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get(
+    "/api/v1/vet_chat/{consultation_id}/turn_state",
+    response_model=VetChatTurnStateResponse,
+)
+async def get_vet_chat_turn_state(consultation_id: str):
+    """
+    Returns the persisted turn state written by the worker so the FE can know
+    whether a turn is 'started', 'error', or 'done' even if SSE disconnected.
+    Reads from: vet_chat_consultations/{consultation_id}.
+    """
+    ref = db.collection("vet_chat_consultations").document(consultation_id)
+    snap = await ref.get()
+
+    if not snap.exists:
+        # No conversation yet → empty state
+        return VetChatTurnStateResponse(consultation_id=consultation_id)
+
+    d = snap.to_dict() or {}
+    return VetChatTurnStateResponse(
+        consultation_id=consultation_id,
+        turn_id=d.get("turn_id"),
+        turn_status=d.get("turn_status"),
+        turn_started_at=d.get("turn_started_at"),
+        turn_completed_at=d.get("turn_completed_at"),
+        turn_updated_at=d.get("turn_updated_at"),
+        turn_error_message=d.get("turn_error_message"),
+        turn_user_message_id=d.get("turn_user_message_id"),
+        turn_assistant_message_id=d.get("turn_assistant_message_id"),
+        turn_last_response_id=d.get("turn_last_response_id"),
+        turn_model=d.get("turn_model"),
+    )
+
+
+
+# --- NEW: Vet Chat cancel response model (place near other Pydantic models) ---
+class VetChatCancelResponse(BaseModel):
+    status: str
+    consultation_id: str
+    turn_id: Optional[str] = None
+
+
+# --- NEW: Vet Chat cooperative cancel endpoint ---
+@app.post("/api/v1/vet_chat/{consultation_id}/cancel",
+          response_model=VetChatCancelResponse,
+          status_code=status.HTTP_202_ACCEPTED)
+async def cancel_vet_chat_turn(consultation_id: str):
+    """
+    Cancels the *current* streaming turn for a given consultation.
+
+    Behavior:
+      - Looks up the consultation doc to get the current turn_id (if any).
+      - Marks turn_status='cancel_requested' immediately.
+      - Sets a turn-scoped sticky cancel flag in Redis with 1h TTL.
+      - Publishes a 'cancel' control event so the worker can stop mid-stream.
+      - Publishes a 'cancel_requested' status event on the main stream channel.
+    """
+    # Look up current turn_id (if no doc/turn -> graceful 'requested' anyway)
+    ref = db.collection(os.getenv("VET_CHAT_COLLECTION", "vet_chat_consultations")).document(consultation_id)
+    snap = await ref.get()
+    turn_id = None
+    if snap.exists:
+        d = snap.to_dict() or {}
+        turn_id = d.get("turn_id")
+
+    # Update persisted UI state → cancel requested
+    await ref.set(
+        {"turn_status": "cancel_requested", "turn_updated_at": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+
+    # Redis control channel + sticky key (scoped to turn if available)
+    control_channel = f"vet_chat:{consultation_id}:control"
+    if turn_id:
+        flag_key = f"vet_chat:{consultation_id}:cancelled:{turn_id}"
+        payload  = {"event": "cancel", "data": {"turn_id": turn_id}}
+    else:
+        # Fallback: generic cancel of "current" (worker will accept if its turn matches or treat as generic)
+        flag_key = f"vet_chat:{consultation_id}:cancelled:any"
+        payload  = {"event": "cancel", "data": {"turn_id": None}}
+
+    stamp = {"ts": datetime.utcnow().isoformat() + "Z"}
+
+    pipe = redis_stream.pipeline()
+    pipe.set(flag_key, json.dumps(stamp), ex=3600)     # sticky 1h
+    pipe.publish(control_channel, json.dumps(payload)) # instant notify
+    await pipe.execute()
+
+    # Optional: nudge UIs on the main SSE channel
+    await redis_stream.publish(
+        f"vet_chat:{consultation_id}",
+        json.dumps({"event": "status", "data": {"phase": "cancel_requested"}})
+    )
+
+    return VetChatCancelResponse(status="cancel_requested", consultation_id=consultation_id, turn_id=turn_id)

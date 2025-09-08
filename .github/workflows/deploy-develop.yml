@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        app: [api, worker, relay, vet_worker]  # added vet_worker
+        app: [api, worker, relay, vet_worker, vet_chat_worker]  # added vet_chat_worker
 
     steps:
       - uses: actions/checkout@v4
@@ -135,11 +135,10 @@ jobs:
           AGENT_RESOURCE_NAME=${{ vars.AGENT_RESOURCE_NAME }},\
           GOOGLE_GENAI_USE_VERTEXAI=${{ vars.GOOGLE_GENAI_USE_VERTEXAI }},\
           DATABASE_URL=${{ secrets.DATABASE_URL }},\
-          PG_DSN=${{secrets.PG_DSN}}"
-          
+          PG_DSN=${{ secrets.PG_DSN }}"
 
-          # Inject the OpenAI key only for vet_worker
-          if [ "$APP_SLUG" = "vet_worker" ]; then
+          # Inject the OpenAI key for OpenAI-powered workers
+          if [ "$APP_SLUG" = "vet_worker" ] || [ "$APP_SLUG" = "vet_chat_worker" ]; then
             ENV="$ENV,OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
           fi
 
@@ -148,3 +147,4 @@ jobs:
           else
             gcloud run deploy "$SERVICE" $BASE --no-allow-unauthenticated --cpu=2 --no-cpu-throttling --cpu-boost --memory=1Gi --min-instances=1 --set-env-vars "$ENV"
           fi
+ 
