@@ -22,7 +22,3 @@ SQLAlchemy==2.0.41              # imported via common.db_conn
 python-dotenv==1.1.1
 openai==1.105.0
 psycopg[binary]==3.2.9
-
-# --- Por que estan en tasks.py --- 
-google-cloud-speech==2.33.0
-google-cloud-storage==3.3.1
