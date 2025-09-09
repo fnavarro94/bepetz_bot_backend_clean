@@ -355,7 +355,8 @@ async def get_continuum_messages(user_id: int, limit: int = 200):
         messages.append(ChatMessage(
             timestamp=m.get("timestamp"),
             role=m.get("role"),
-            content=m.get("content", ""),
+            content=((m.get("content") or "").strip()
+                      or ((m.get("asr") or {}).get("text") or "").strip()),
             attachments=m.get("attachments") or [],
         ))
     return MessagesResponse(conversation_id=conv_id, messages=messages)
@@ -365,22 +366,49 @@ async def get_continuum_messages(user_id: int, limit: int = 200):
 async def get_upload_url(req: UploadURLRequest):
     """
     Pre-sign a GCS PUT URL for file uploads. Path is per-user (no conversation id).
+    Filename extension is normalized to the provided MIME type so downstream
+    workers can reason about formats reliably (e.g., .m4a for audio/mp4).
     """
     bucket_name = os.getenv("CHAT_UPLOAD_BUCKET")
     if not bucket_name:
         raise RuntimeError("CHAT_UPLOAD_BUCKET env var is required")
 
-    object_path = f"{req.user_id}/incoming/{uuid4()}_{req.file_name}"
+    # Normalize extension from MIME (ignore codec suffixes like ';codecs=opus')
+    base_mime = req.mime_type.split(";", 1)[0].strip().lower()
+    ext_map = {
+        "audio/webm": "webm",
+        "audio/ogg": "ogg",
+        "audio/opus": "opus",
+        "audio/mp4": "m4a",     # iOS/Safari voice notes
+        "audio/aac": "m4a",     # treat AAC as m4a container downstream
+        "audio/mpeg": "mp3",
+        "audio/wav": "wav",
+        "audio/x-wav": "wav",
+        "audio/flac": "flac",
+    }
+
+    # Pick extension: prefer MIME-derived; else keep/derive from provided file_name; else 'bin'
+    requested_name = os.path.basename(req.file_name or "upload")  # defensive
+    name_root, name_ext = os.path.splitext(requested_name)
+    mime_ext = ext_map.get(base_mime)
+    final_ext = mime_ext or (name_ext.lstrip(".") if name_ext else "") or "bin"
+    safe_name = f"{name_root}.{final_ext}"
+
+    object_path = f"{req.user_id}/incoming/{uuid4()}_{safe_name}"
+
     client = storage.Client()
     blob = client.bucket(bucket_name).blob(object_path)
 
+    # Signed URL enforces the exact Content-Type the client must PUT with
     url = _generate_put_signed_url(blob, content_type=req.mime_type, minutes=15)
+
     return UploadURLResponse(
         upload_url=url,
         bucket=bucket_name,
         object_path=object_path,
         expires_at=datetime.utcnow() + timedelta(minutes=15),
     )
+
 
 
 @app.get("/api/v1/sessions/{user_id}/list", response_model=SessionListResponse)
@@ -496,7 +524,7 @@ async def get_session_view(user_id: int, session_id: str):
         return ChatMessage(
             timestamp=d.get("timestamp"),
             role=d.get("role", "assistant"),
-            content=d.get("content", ""),
+            content=((d.get("content") or "").strip() or ((d.get("asr") or {}).get("text") or "").strip()),
             attachments=d.get("attachments") or [],
         )
 
