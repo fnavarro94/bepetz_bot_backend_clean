@@ -26,9 +26,22 @@ import httpx
 
 from google.cloud import storage
 from google.genai import types   # ADK uses Part/Blob underneath
+# --- Speech-to-Text v2 (Chirp 2) ---
+from google.cloud import speech_v2 as speech  # v2 API, supports chirp_2
+# --- ASR helper (Chirp 2) ---
+from .asr_chirp2 import (
+    SPEECH_ENABLE,
+    is_audio_attachment,
+    to_gcs_uri,
+    normalize_audio_to_gcs_wav,          # ← NEW
+    transcribe_gcs_with_chirp2,
+    # or use transcribe_normalized_attachment for a one-liner
+)
+
+
 
 from dotenv import load_dotenv
-from google.cloud.firestore_v1 import FieldFilter
+
 load_dotenv(override=True)
 
 
@@ -93,6 +106,9 @@ STREAM_REDIS_SSL  = os.getenv("STREAM_REDIS_SSL", "false").lower() == "true"
 SOFT_LIMIT = int(os.getenv("SESSION_SOFT_TOKENS", "2500"))
 HARD_LIMIT = int(os.getenv("SESSION_HARD_TOKENS", "3000"))
 DUMMY_DELAY = int(os.getenv("DUMMY_SUMMARY_DELAY_SECONDS", "3"))
+# Max bytes to inline into a Part; larger files try gs:// URI (if supported)
+MAX_INLINE_BYTES = int(os.getenv("ATTACH_INLINE_MAX_BYTES", "10485760"))  # 10 MB
+
 
 print(f"Running with SOFT_LIMIT {SOFT_LIMIT} and hard limmit {HARD_LIMIT} ultima version. with dummy delay {DUMMY_DELAY}")
 
@@ -128,6 +144,103 @@ async def _fetch_pets(user_id: int) -> dict:
         logger.warning("pet_fetch_failed", extra={"user_id": user_id, "err": str(e)})
         return {}
 # Helper to log usage from Firestore control-plane
+
+def _guess_mime(att: dict) -> str:
+    # Prefer provided mime_type; fall back to filename; last resort octet-stream
+    mt = (att.get("mime_type")
+          or mimetypes.guess_type(att.get("file_name", ""))[0]
+          or "application/octet-stream")
+    return mt
+
+def _mk_part_from_bytes(data: bytes, mime: str):
+    # Support both google-genai APIs (some versions expose from_bytes, others only Blob)
+    try:
+        return types.Part.from_bytes(data=data, mime_type=mime)  # older convenience API
+    except Exception:
+        blob = types.Blob(mime_type=mime, data=data)
+        return types.Part.from_blob(blob)
+
+async def _build_parts_from_attachments(
+    attachments: list[dict] | None,
+) -> list[types.Part]:
+    """
+    Build model-ready Parts for non-audio files.
+    - If SPEECH_ENABLE is True, audio is handled by ASR → skipped here.
+    - If SPEECH_ENABLE is False, audio is included as raw media (so the model can 'hear' it).
+    - Small files (<= MAX_INLINE_BYTES) are inlined as bytes.
+    - Large files try gs:// URI Parts; if unsupported, they are skipped with a warning.
+    """
+    out: list[types.Part] = []
+    if not attachments:
+        return out
+
+    for a in attachments:
+        try:
+            is_audio = is_audio_attachment(a)
+            if is_audio and SPEECH_ENABLE:
+                # ASR path will inject transcript into the text message; don't double-send audio.
+                continue
+
+            bucket = a.get("bucket")
+            object_path = a.get("object_path")
+            if not bucket or not object_path:
+                continue
+
+            mime = _guess_mime(a)
+            blob = gcs.bucket(bucket).blob(object_path)
+
+            # metadata (size) without blocking event loop
+            await asyncio.to_thread(blob.reload)
+            size = int(blob.size or 0)
+
+            # Large file → try URI-based part first
+            if size > MAX_INLINE_BYTES:
+                gs_uri = f"gs://{bucket}/{object_path}"
+                try:
+                    p = types.Part.from_uri(gs_uri, mime_type=mime)
+                    out.append(p)
+                    logger.info(
+                        "attachment_uri_part",
+                        extra={"mime": mime, "size": size, "uri": gs_uri, "mode": "uri"}
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning(
+                        "attachment_uri_part_unsupported",
+                        extra={"mime": mime, "size": size, "uri": gs_uri, "err": str(e)}
+                    )
+                    # Fallback: skip very large file to avoid loading into RAM
+                    continue
+
+            # Small enough → inline bytes
+            data = await asyncio.to_thread(blob.download_as_bytes)
+            part = _mk_part_from_bytes(data, mime)
+            out.append(part)
+            logger.info(
+                "attachment_inlined",
+                extra={
+                    "mime": mime,
+                    "size": len(data),
+                    "bucket": bucket,
+                    "object_path": object_path,
+                    "mode": "inline",
+                },
+            )
+
+        except Exception as e:
+            logger.warning(
+                "attachment_build_failed",
+                extra={
+                    "mime": a.get("mime_type"),
+                    "file": a.get("file_name"),
+                    "bucket": a.get("bucket"),
+                    "object_path": a.get("object_path"),
+                    "err": str(e),
+                },
+            )
+    return out
+
+
 async def log_session_usage(user_id: int, session_id: str, note: str = ""):
     cont_ref = db.collection("continuums").document(str(user_id))
     snap = await cont_ref.get()
@@ -341,7 +454,7 @@ async def process_message_task(
         user_message_id=user_msg_id,     # you’ll use this same id when you persist the message
     )
 
-    
+     
 
     await user_msg_doc.set({
         "timestamp": firestore.SERVER_TIMESTAMP,
@@ -353,6 +466,71 @@ async def process_message_task(
         "session_id": session_id,            # <<< ADD
         "post_trigger": is_post_trigger,
     })
+
+    # --- If we got an audio attachment, run ASR first -------------------------
+    audio_att = next((a for a in (attachments or []) if is_audio_attachment(a)), None)
+    transcript_info = None
+
+    if SPEECH_ENABLE and audio_att:
+        try:
+            gcs_uri = to_gcs_uri(audio_att)
+            await publish_status(
+                conv_id, "status",
+                phase="asr_started",
+                user_id=str(user_id),
+                user_message_id=user_msg_id,
+                mime=audio_att.get("mime_type"),
+                gcs_uri=gcs_uri,
+            )
+
+            # Optional: build domain biasing (pet names/meds) if desired
+            # hints = await _build_asr_hints(user_id)  # (you can add this later)
+            gs_uri_norm, norm_meta = await normalize_audio_to_gcs_wav(audio_att)
+            transcript_info = await transcribe_gcs_with_chirp2(GCP_PROJECT_ID, gs_uri_norm)
+
+            await user_msg_doc.set({
+                "asr": {
+                    "text": transcript_info.get("text", ""),
+                    "confidence": transcript_info.get("confidence"),
+                    "model": transcript_info.get("model"),
+                    "language_codes": transcript_info.get("language_codes"),
+                    "gcs_uri": transcript_info.get("gcs_uri"),
+                }
+            }, merge=True)
+
+            t = (transcript_info or {}).get("text", "").strip()
+
+            if t and not (message or "").strip():
+                # Make transcript the canonical message text for history/summary
+                await user_msg_doc.set({"content": t, "content_source": "asr"}, merge=True)
+
+                # (Optional) push a UI patch so the FE shows text immediately
+                await publish_status(
+                    conv_id, "status",
+                    phase="message_patch",
+                    user_id=str(user_id),
+                    user_message_id=user_msg_id,
+                    content=t,
+                    content_source="asr",
+                )
+
+            await publish_status(
+                conv_id, "status",
+                phase="asr_done",
+                user_id=str(user_id),
+                user_message_id=user_msg_id,
+                text_snippet=_snippet(transcript_info.get("text",""), 180),
+                confidence=transcript_info.get("confidence"),
+            )
+        except Exception as e:
+            logger.error("asr_failed", extra={"user_id": user_id, "err": str(e)})
+            await publish_status(
+                conv_id, "status",
+                phase="asr_error",
+                user_id=str(user_id),
+                user_message_id=user_msg_id,
+                error=str(e),
+            )
 
     await convo_doc_ref.set({"last_message_at": firestore.SERVER_TIMESTAMP}, merge=True)
 
@@ -608,52 +786,114 @@ async def process_message_task(
         "generation": generation,
     })
 
-    # 5) Build parts from attachments (optional – keep your existing code)
-    parts = []
+   # 5) Build Parts from attachments (non-audio when ASR enabled)
+    parts = await _build_parts_from_attachments(attachments)
+    await publish_status(
+        conv_id, "status",
+        phase="attachments_ready",
+        user_id=str(user_id),
+        user_message_id=user_msg_id,
+        attachment_count=len(attachments or []),
+        part_count=len(parts),
+    )
     # (Load from GCS if you want inline_data; omitted here for brevity.)
 
-    # 6) Stream to engine & publish chunks
+    # 6) Stream to engine & publish chunks (Redis-only) + always end the turn
     full_reply_parts: list[str] = []
+
+    # Compose the final text to send to the agent
+    final_message = message
+    if transcript_info and transcript_info.get("text"):
+        if not (final_message or "").strip():
+            final_message = transcript_info["text"]
+            print(f"El transcript es {transcript_info["text"]}")
+        else:
+            final_message = f"{final_message}\n\n \n{transcript_info['text']}"
+
+    final_message = (final_message or "").strip()
+
+    # ✅ allow attachments-only (no text) – if we have Parts, proceed
+    if not final_message and parts:
+        # Some backends require non-empty text; use an invisible char (ZWSP) to satisfy them without a visible prompt.
+        final_message = "\u200b"  # zero-width space
+
+        # Optional: tell the UI this turn was attachments-only (harmless if UI ignores it)
+        await publish_status(
+            conv_id, "status",
+            phase="attachments_only",
+            user_id=str(user_id),
+            user_message_id=user_msg_id,
+            attachment_count=len(attachments or []),
+            part_count=len(parts),
+        )
+
+    # ❌ only abort if there’s neither text nor attachments
+    if not final_message and not parts:
+        logger.warning("empty_final_message", extra={"user_id": user_id, "message_id": user_msg_id})
+        await publish_status(
+            conv_id, "status",
+            phase="done",
+            user_id=str(user_id),
+            user_message_id=user_msg_id,
+            reason="empty_input"
+        )
+        return
+
+    assistant_msg_id = None
+
+    print(f"Este es el mensaje final enviado al agente {final_message}")
     try:
         async for chunk, is_first in run_agent_stream(
-            str(user_id), session_id, message, attachments=parts
+            str(user_id), session_id, final_message, attachments=parts
         ):
             full_reply_parts.append(chunk)
-
-            # Pub/Sub (ordering key = continuum id)
-            await publish_non_blocking(
-                publisher, TOPIC_PATH, ordering_key=conv_id,
-                user_id=str(user_id), conversation_id=conv_id,
-                chunk=chunk, message_id=str(uuid.uuid4())
-            )
-            # Redis (optional)
+            # Redis stream only
             publish_non_blocking_redis(conv_id, chunk)
 
     except Exception as exc:
-        logger.error("Streaming/publish failure: %s", exc, exc_info=True)
+        logger.error("streaming_failed", exc_info=True, extra={"user_id": user_id, "session_id": session_id})
+        await publish_status(
+            conv_id, "status",
+            phase="error",
+            user_id=str(user_id),
+            user_message_id=user_msg_id,
+            error=str(exc),
+        )
 
-    # 7) Persist assistant message
-    full_reply = "".join(full_reply_parts)
-    if full_reply:
-        bot_msg_ref = msg_ref.document()  # auto-ID (or use uuid4 like the user message)
-        await bot_msg_ref.set({
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "role": "assistant",
-            "content": full_reply,
-            "attachments": [],
-            "type": "message",
-            "generation": generation,
-            "session_id": session_id,
-        })
+    finally:
+        full_reply = "".join(full_reply_parts)
+        if full_reply:
+            bot_msg_ref = msg_ref.document()
+            assistant_msg_id = bot_msg_ref.id
+            await bot_msg_ref.set({
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "role": "assistant",
+                "content": full_reply,
+                "attachments": [],
+                "type": "message",
+                "generation": generation,
+                "session_id": session_id,
+            })
+            await db.collection("sessions").document(session_id).collection("timeline").add({
+                "ts": firestore.SERVER_TIMESTAMP,
+                "kind": "message_ref",
+                "message_id": bot_msg_ref.id,
+                "role": "assistant",
+                "generation": generation,
+            })
 
-        # timeline entry for the assistant message
-        await db.collection("sessions").document(session_id).collection("timeline").add({
-            "ts": firestore.SERVER_TIMESTAMP,
-            "kind": "message_ref",
-            "message_id": bot_msg_ref.id,
-            "role": "assistant",
-            "generation": generation,
-        })
+        # Always end the turn
+        await publish_status(
+            conv_id, "status",
+            phase="done",
+            user_id=str(user_id),
+            user_message_id=user_msg_id,
+            **({"assistant_message_id": assistant_msg_id} if assistant_msg_id else {})
+        )
+
+    
+  
+
 
 
     # === NEW: log delta & totals ===
