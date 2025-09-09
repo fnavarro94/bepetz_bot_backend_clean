@@ -39,6 +39,10 @@ from .asr_chirp2 import (
 )
 
 
+from .cancel_helpers import (
+    CancelCtx, UserCancelled, make_cancel_event, handle_cancelled
+)
+
 
 from dotenv import load_dotenv
 
@@ -412,6 +416,16 @@ else:
     logger.info("[Init] STREAM_REDIS_HOST not set → Redis streaming disabled")
 
 
+
+CANCEL_CTX = CancelCtx(
+    db=db,
+    redis=redis_stream,
+    publish_status=publish_status,
+    log_event=log_event_fs,
+    logger=logger,
+    continuum_id=continuum_id,
+)
+
 # ------------------------------------------------------------------------------
 #  Taskiq task
 # ------------------------------------------------------------------------------
@@ -424,7 +438,7 @@ async def process_message_task(
     
     
    
-
+    turn_cutoff_ts = datetime.now(timezone.utc)
     conv_id = continuum_id(user_id)
     convo_doc_ref = db.collection("conversations").document(conv_id)
     msg_ref = convo_doc_ref.collection("messages")
@@ -442,6 +456,11 @@ async def process_message_task(
     status = cont.get("status", "active")
     generation = int(cont.get("generation", 0))
     is_post_trigger = status in ("summarizing", "ready_to_rollover")
+
+
+    # NEW: pick up the ignore-cancel flag
+    ignore_cancelled_turn = bool(cont.get("ignore_cancelled_turn"))
+    ignore_cancelled_turn_user_msg_id = cont.get("ignore_cancelled_turn_user_msg_id")
 
     # 3) Persist the user message to evergreen timeline immediately
     user_msg_id = str(uuid.uuid4())
@@ -466,6 +485,22 @@ async def process_message_task(
         "session_id": session_id,            # <<< ADD
         "post_trigger": is_post_trigger,
     })
+
+
+        # Build a cancel event for this turn (use user_msg_id as the turn-id)
+    cancel_event = await make_cancel_event(CANCEL_CTX, user_id, user_msg_id)
+
+    # If already cancelled before we even start streaming, short-circuit
+    if cancel_event.is_set():
+        print("cancle event was set before doing anything")
+        await handle_cancelled(
+            CANCEL_CTX,
+            user_id=user_id, conv_id=conv_id, msg_ref=msg_ref,
+            user_msg_id=user_msg_id, session_id=session_id, generation=generation,
+            partial_text=partial,                      # whatever you had before
+            worker_cutoff_ts=turn_cutoff_ts,          # ← pass the worker-provided cutoff
+        )
+        return
 
     # --- If we got an audio attachment, run ASR first -------------------------
     audio_att = next((a for a in (attachments or []) if is_audio_attachment(a)), None)
@@ -806,11 +841,37 @@ async def process_message_task(
     if transcript_info and transcript_info.get("text"):
         if not (final_message or "").strip():
             final_message = transcript_info["text"]
-            print(f"El transcript es {transcript_info["text"]}")
+            print(f"El transcript es {transcript_info['text']}")
         else:
             final_message = f"{final_message}\n\n \n{transcript_info['text']}"
 
     final_message = (final_message or "").strip()
+
+    ## new
+
+    if ignore_cancelled_turn:
+        system_hint = (
+            "System note: The previous user turn was cancelled. "
+            "Do not answer or revisit that cancelled request; focus only on the current input."
+        )
+        final_message = f"{system_hint}\n\n{final_message}" if final_message else system_hint
+
+        # Clear the flag so it's used once
+        await cont_ref.update({
+            "ignore_cancelled_turn": firestore.DELETE_FIELD,
+            "ignore_cancelled_turn_user_msg_id": firestore.DELETE_FIELD,
+            "ignore_cancelled_turn_consumed_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        await log_event_fs(user_id, "cancel_ignore_hint_applied", {
+            "cancelled_turn_user_msg_id": ignore_cancelled_turn_user_msg_id
+        })
+        logger.info("cancel_ignore_hint_applied", extra={
+            "user_id": user_id,
+            "session_id": session_id,
+            "cancelled_turn_user_msg_id": ignore_cancelled_turn_user_msg_id
+        })
+    ## end new
 
     # ✅ allow attachments-only (no text) – if we have Parts, proceed
     if not final_message and parts:
@@ -842,13 +903,36 @@ async def process_message_task(
     assistant_msg_id = None
 
     print(f"Este es el mensaje final enviado al agente {final_message}")
+    was_cancelled = False
     try:
+        if cancel_event.is_set():
+            was_cancelled = True
+            print(f"Event was canceled before streaming")
+            raise UserCancelled()
+        
         async for chunk, is_first in run_agent_stream(
             str(user_id), session_id, final_message, attachments=parts
         ):
+            if cancel_event.is_set():
+                print("Event was canceled during streaming")
+                was_cancelled = True
+                raise UserCancelled()
+
+            if not chunk:
+                continue
+
             full_reply_parts.append(chunk)
-            # Redis stream only
             publish_non_blocking_redis(conv_id, chunk)
+
+    except UserCancelled:
+        partial = "".join(full_reply_parts) if full_reply_parts else None
+        await handle_cancelled(
+            CANCEL_CTX,
+            user_id=user_id, conv_id=conv_id, msg_ref=msg_ref,
+            user_msg_id=user_msg_id, session_id=session_id, generation=generation,
+            partial_text=partial,
+        )
+        return
 
     except Exception as exc:
         logger.error("streaming_failed", exc_info=True, extra={"user_id": user_id, "session_id": session_id})
@@ -861,35 +945,36 @@ async def process_message_task(
         )
 
     finally:
-        full_reply = "".join(full_reply_parts)
-        if full_reply:
-            bot_msg_ref = msg_ref.document()
-            assistant_msg_id = bot_msg_ref.id
-            await bot_msg_ref.set({
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "role": "assistant",
-                "content": full_reply,
-                "attachments": [],
-                "type": "message",
-                "generation": generation,
-                "session_id": session_id,
-            })
-            await db.collection("sessions").document(session_id).collection("timeline").add({
-                "ts": firestore.SERVER_TIMESTAMP,
-                "kind": "message_ref",
-                "message_id": bot_msg_ref.id,
-                "role": "assistant",
-                "generation": generation,
-            })
+        if not was_cancelled:
+            full_reply = "".join(full_reply_parts)
+            if full_reply:
+                bot_msg_ref = msg_ref.document()
+                assistant_msg_id = bot_msg_ref.id
+                await bot_msg_ref.set({
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                    "role": "assistant",
+                    "content": full_reply,
+                    "attachments": [],
+                    "type": "message",
+                    "generation": generation,
+                    "session_id": session_id,
+                })
+                await db.collection("sessions").document(session_id).collection("timeline").add({
+                    "ts": firestore.SERVER_TIMESTAMP,
+                    "kind": "message_ref",
+                    "message_id": bot_msg_ref.id,
+                    "role": "assistant",
+                    "generation": generation,
+                })
 
-        # Always end the turn
-        await publish_status(
-            conv_id, "status",
-            phase="done",
-            user_id=str(user_id),
-            user_message_id=user_msg_id,
-            **({"assistant_message_id": assistant_msg_id} if assistant_msg_id else {})
-        )
+            # Always end the turn
+            await publish_status(
+                conv_id, "status",
+                phase="done",
+                user_id=str(user_id),
+                user_message_id=user_msg_id,
+                **({"assistant_message_id": assistant_msg_id} if assistant_msg_id else {})
+            )
 
     
   

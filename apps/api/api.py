@@ -362,6 +362,71 @@ async def get_continuum_messages(user_id: int, limit: int = 200):
     return MessagesResponse(conversation_id=conv_id, messages=messages)
 
 
+# --- Chat (continuum) cooperative cancel -------------------------------------
+from typing import Optional
+from pydantic import BaseModel
+
+CANCEL_STICKY_TTL_SECONDS = int(os.getenv("CANCEL_STICKY_TTL_SECONDS", "3600"))
+
+class ChatCancelResponse(BaseModel):
+    status: str
+    user_id: int
+    turn_id: Optional[str] = None
+
+@app.post("/api/v1/continuum/{user_id}/cancel",
+          response_model=ChatCancelResponse,
+          status_code=status.HTTP_202_ACCEPTED)
+async def cancel_continuum_turn(
+    user_id: int,
+    turn_id: Optional[str] = None,   # recommend passing the user_msg_id here
+    reason: Optional[str] = None,    # optional: for audit/logging
+):
+    """
+    Cooperatively cancels the *current turn* for the user's evergreen continuum.
+
+    Behavior:
+      - Sets a sticky cancel flag in Redis (scoped to the given turn_id or 'any').
+      - Publishes a control 'cancel' event so the worker stops streaming ASAP.
+      - Publishes a 'cancel_requested' status event on the main stream channel.
+
+    Notes:
+      - Control channel:   u{user_id}:continuum:control
+      - Sticky keys:       u{user_id}:continuum:cancelled:{turn_id}  OR  ...:cancelled:any
+      - Main stream key:   u{user_id}:continuum
+    """
+    conv_id = continuum_id_for_user(user_id)
+
+    control_channel = f"{conv_id}:control"
+    flag_key = f"{conv_id}:cancelled:{turn_id}" if turn_id else f"{conv_id}:cancelled:any"
+
+    # Sticky flag (lets a late-joining worker see the cancel immediately)
+    stamp = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "turn_id": turn_id,
+        "reason": reason or "user",
+    }
+
+    # Live control event the worker listens for
+    payload = {"event": "cancel", "data": {"turn_id": turn_id}}
+
+    pipe = redis_stream.pipeline()
+    pipe.set(flag_key, json.dumps(stamp), ex=CANCEL_STICKY_TTL_SECONDS)
+    pipe.publish(control_channel, json.dumps(payload))
+    await pipe.execute()
+
+    # Optional: nudge the UI on the main stream channel
+    try:
+        await redis_stream.publish(
+            conv_id,
+            json.dumps({"event": "status", "data": {"phase": "cancel_requested", "turn_id": turn_id}})
+        )
+    except Exception:
+        pass  # non-fatal
+
+    return ChatCancelResponse(status="cancel_requested", user_id=user_id, turn_id=turn_id)
+
+
+
 @app.post("/api/v1/upload-url", response_model=UploadURLResponse)
 async def get_upload_url(req: UploadURLRequest):
     """

@@ -25,6 +25,8 @@ google-adk==1.5.0                    # ensure_session, run_agent_stream, create_
 # --------------------------------------------------------------------
 fastapi==0.115.14
 uvicorn==0.35.0
+psycopg[binary]==3.2.9
+
 
 # --------------------------------------------------------------------
 # Local‑dev convenience (env‑file support)
