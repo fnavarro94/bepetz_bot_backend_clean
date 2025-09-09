@@ -25,3 +25,4 @@ psycopg[binary]==3.2.9
 
 # --- Por que estan en tasks.py --- 
 google-cloud-speech==2.33.0
+google-cloud-storage==3.3.1
