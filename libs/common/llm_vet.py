@@ -19,7 +19,9 @@ from common.vet_db_context import (
 import asyncio
 from typing import Callable, Awaitable
 import typing
-
+from datetime import datetime, date
+from decimal import Decimal
+import uuid
 logger = logging.getLogger("vet-llm")
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
@@ -41,6 +43,34 @@ TOP_P = os.getenv("VET_LLM_TOP_P")
 _AsyncOpenAI = None
 _client = None
 _openai_import_err: Optional[BaseException] = None
+
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+def _json_default(o: Any):
+    if isinstance(o, (datetime, date)):
+        # ISO 8601 is safest for APIs and easy to parse later
+        return o.isoformat()
+    if isinstance(o, Decimal):
+        return float(o)
+    if isinstance(o, uuid.UUID):
+        return str(o)
+    if isinstance(o, (set, frozenset)):
+        return list(o)
+    if isinstance(o, bytes):
+        # best effort text decode; avoids hard failure
+        return o.decode("utf-8", errors="replace")
+    # Dataclasses or objects that expose a JSON representation
+    try:
+        import dataclasses
+        if dataclasses.is_dataclass(o):
+            return dataclasses.asdict(o)
+    except Exception:
+        pass
+    if hasattr(o, "__json__"):
+        return o.__json__()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+def _jdumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=_json_default)
 
 
 class LLMUserCancelled(Exception):
@@ -212,7 +242,7 @@ async def _structured_call(
 
     messages = [
         {"role": "system", "content": system_prompt.strip()},
-        {"role": "user", "content": json.dumps(user_context, ensure_ascii=False)},
+        {"role": "user", "content": _jdumps(user_context)},
     ]
 
     kwargs: Dict[str, Any] = {
@@ -299,11 +329,11 @@ async def _structured_call_cancelable_responses(
     req = {
         "model": MODEL,
         "instructions": system_prompt.strip(),
-        "input": [
+         "input": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": json.dumps(user_context, ensure_ascii=False)}
+                    {"type": "input_text", "text": _jdumps(user_context)}
                 ],
             }
         ],
