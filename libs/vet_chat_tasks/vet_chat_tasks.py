@@ -155,10 +155,26 @@ async def _publish_delta(consultation_id: str, text: str) -> None:
         return
     await redis_stream.publish(_channel(consultation_id), text)
 
+
+# Inline citation patch: FE places a link next to the supported text span.
+async def _publish_citation_patch(
+    consultation_id: str,
+    *,
+    start: int | None,
+    end: int | None,
+    url: str | None,
+    title: str | None = None,
+) -> None:
+    if not redis_stream or not url:
+        return
+    ev = {"event": "citation", "data": {"start": start, "end": end, "url": url, "title": title}}
+    await redis_stream.publish(_channel(consultation_id), json.dumps(ev))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config knobs
 # ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_MODEL            = os.getenv("VET_CHAT_MODEL", "gpt-4o-mini")
+DEFAULT_MODEL            = os.getenv("VET_CHAT_MODEL", "gpt-5-mini")
 DEFAULT_INSTRUCTIONS     = os.getenv("VET_CHAT_INSTRUCTIONS")
 DEFAULT_REASONING_EFFORT = os.getenv("VET_CHAT_REASONING_EFFORT")
 DEFAULT_MAX_OUTPUT       = os.getenv("VET_CHAT_MAX_OUTPUT_TOKENS")
@@ -438,48 +454,66 @@ async def process_vet_chat_message_task(
 
         # 5) Stream using Responses API (helper always uses Responses)
         # 5) Stream using Responses API (helper always uses Responses)
+        citations_inline: list[dict] = []
         async def _publish_loop():
             nonlocal delta_count, last_log_t, was_cancelled
             for chunk in helper.stream_text(
                 user_text=message,
                 system_prompt=system_prompt,
                 max_output_tokens=max_output_tokens,
-                reasoning_effort=reasoning_effort,   # only effective for GPT-5.*
-                previous_response_id=prev_res_id,    # chain continuity
+                reasoning_effort=reasoning_effort,
+                previous_response_id=prev_res_id,
                 metadata={"consultation_id": consultation_id, "app_id": app_id, "turn_id": turn_id},
-                store=True,                           # keep retrievable by response.id
+                store=True,
             ):
-                # ── Cooperative cancel: stop both locally and on OpenAI's side ──
+                # Cooperative cancel
                 if cancel_event.is_set():
                     was_cancelled = True
                     try:
-                        # Best-effort: explicitly cancel the in-flight Responses job
                         helper.cancel_current()
                     finally:
-                        # Exit the streaming loop; outer handler will mark 'cancelled'
                         raise UserCancelled()
 
                 if not chunk:
                     continue
 
-                assistant_text_chunks.append(chunk)
-                delta_count += 1
-                await _publish_delta(consultation_id, chunk)
+                # ---- NEW: inline citation events (dict) ----
+                if isinstance(chunk, dict) and chunk.get("event") == "citation":
+                    await _publish_citation_patch(
+                        consultation_id,
+                        start=chunk.get("start"),
+                        end=chunk.get("end"),
+                        url=chunk.get("url"),
+                        title=chunk.get("title"),
+                    )
+                    citations_inline.append({
+                        "start": chunk.get("start"),
+                        "end": chunk.get("end"),
+                        "url": chunk.get("url"),
+                        "title": chunk.get("title"),
+                    })
+                    continue
 
-                # Lightweight streaming heartbeat logs
-                if LOG_STREAM:
-                    now = time.monotonic()
-                    if delta_count == 1 or (now - last_log_t) >= STREAM_LOG_HEARTBEAT_S:
-                        logger.info(
-                            "vet_chat_stream_delta",
-                            extra={
-                                "consultation_id": consultation_id,
-                                "chunks": delta_count,
-                                "delta_len": len(chunk),
-                                "delta_snippet": chunk[:80],
-                            },
-                        )
-                        last_log_t = now
+                # ---- Existing text streaming (str) ----
+                if isinstance(chunk, str):
+                    assistant_text_chunks.append(chunk)
+                    delta_count += 1
+                    await _publish_delta(consultation_id, chunk)
+
+                    if LOG_STREAM:
+                        now = time.monotonic()
+                        if delta_count == 1 or (now - last_log_t) >= STREAM_LOG_HEARTBEAT_S:
+                            logger.info(
+                                "vet_chat_stream_delta",
+                                extra={
+                                    "consultation_id": consultation_id,
+                                    "chunks": delta_count,
+                                    "delta_len": len(chunk),
+                                    "delta_snippet": chunk[:80],
+                                },
+                            )
+                            last_log_t = now
+
 
         try:
             await _publish_loop()
@@ -508,6 +542,7 @@ async def process_vet_chat_message_task(
                 "complete": True,
                 "chunks": delta_count,
                 "system_instructions": system_prompt,
+                "citations_inline": citations_inline,  # <- optional
             }
             assistant_doc_ref, _ = await _persist_message(
                 consultation_id,
