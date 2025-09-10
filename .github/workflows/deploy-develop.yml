@@ -139,7 +139,8 @@ jobs:
 
           # Inject the OpenAI key for OpenAI-powered workers
           if [ "$APP_SLUG" = "vet_worker" ] || [ "$APP_SLUG" = "vet_chat_worker" ]; then
-            ENV="$ENV,OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
+            ENV="$ENV,OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }},\ 
+                       VET_CHAT_MODEL=${{VARS.VET_CHAT_MODEL}}"
           fi
 
           if [ "$APP_SLUG" = "api" ] || [ "$APP_SLUG" = "relay" ]; then
