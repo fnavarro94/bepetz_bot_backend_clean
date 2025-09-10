@@ -83,7 +83,7 @@ services:
       STREAM_REDIS_SSL: "false"
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/service_account.json
       # Optional GPT-5 settings (or put them in .env)
-      # VET_CHAT_MODEL: gpt-5
+      VET_CHAT_MODEL: gpt-5
       # VET_CHAT_INSTRUCTIONS: "You are a helpful veterinary assistant."
       # VET_CHAT_VERBOSITY: medium
       # VET_CHAT_REASONING_EFFORT: low
