@@ -15,6 +15,8 @@ from google.cloud import firestore
 from common.broker import vet_chat_broker
 from vet_chat_tasks.openai_helper import OpenAIChatHelper
 import contextlib
+# worker.py (top, with other imports)
+from vet_chat_tasks.prompt import VET_SYSTEM_PROMPT
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging (structured JSON)
@@ -175,7 +177,7 @@ async def _publish_citation_patch(
 # Config knobs
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_MODEL            = os.getenv("VET_CHAT_MODEL", "gpt-5-mini")
-DEFAULT_INSTRUCTIONS     = os.getenv("VET_CHAT_INSTRUCTIONS")
+DEFAULT_INSTRUCTIONS     = VET_SYSTEM_PROMPT
 DEFAULT_REASONING_EFFORT = os.getenv("VET_CHAT_REASONING_EFFORT")
 DEFAULT_MAX_OUTPUT       = os.getenv("VET_CHAT_MAX_OUTPUT_TOKENS")
 DEFAULT_MAX_OUTPUT       = int(DEFAULT_MAX_OUTPUT) if (DEFAULT_MAX_OUTPUT and DEFAULT_MAX_OUTPUT.isdigit()) else None
