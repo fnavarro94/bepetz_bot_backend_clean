@@ -174,7 +174,7 @@ async def _publish_citation_patch(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config knobs
+# Config knobs 
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_MODEL            = os.getenv("VET_CHAT_MODEL", "gpt-5-mini")
 DEFAULT_INSTRUCTIONS     = VET_SYSTEM_PROMPT
